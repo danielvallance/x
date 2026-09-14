@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -311,6 +312,29 @@ func TestSession(t *testing.T) {
 	}
 }
 
+func TestSessionHistory(t *testing.T) {
+	s := &state{
+		cfg:     Config{Builtins: builtinsNamed("start")},
+		history: &sessionHistory{},
+	}
+	for _, line := range []string{"echo one", "echo two", "echo two", "  "} {
+		_, err := s.history.Write(line)
+		require.NoError(t, err)
+	}
+
+	var out captured
+	require.NoError(t, s.runSessionBuiltin(Streams{Stdout: &out, Stderr: &out}, []string{"history"}))
+	assert.Equal(t, "    1  echo one\n    2  echo two\n", out.String())
+
+	assert.Equal(t, []string{"history", "start"}, s.builtinNames())
+
+	bare := &state{}
+	out.Reset()
+	err := bare.runSessionBuiltin(Streams{Stdout: &out, Stderr: &out}, []string{"history"})
+	assert.Equal(t, interp.ExitStatus(1), err, "no prompt, no history to show")
+	assert.Contains(t, out.String(), "only at the prompt")
+}
+
 // chattyTransport writes straight to the streams, as the remote log poller
 // does once a command starts producing output.
 type chattyTransport struct{}
@@ -544,31 +568,83 @@ func TestShellNeedsATerminal(t *testing.T) {
 }
 
 func TestAnUnknownBuiltinIsNamed(t *testing.T) {
+	var out captured
+	code, err := Run(t.Context(), Config{
+		Instance:  "fake",
+		Dir:       newFixture(t),
+		Command:   ":frobnicate",
+		Transport: local(),
+	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	require.NoError(t, err)
+
+	assert.Equal(t, statusBuiltinNotFound, code)
+	assert.Equal(t, "unknown builtin \"frobnicate\"; try :help\n", ansi.Strip(out.String()),
+		":help is the session's, so there is always one to point at")
+}
+
+func TestSessionBuiltinNamesAreReserved(t *testing.T) {
+	var out captured
+	_, err := Run(t.Context(), Config{
+		Instance:  "fake",
+		Dir:       newFixture(t),
+		Transport: local(),
+		Builtins:  builtinsNamed("start", "history"),
+	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	require.ErrorContains(t, err, `"history"`)
+
+	assert.Empty(t, out.String())
+}
+
+func TestSessionBuiltinsOutsideThePrompt(t *testing.T) {
 	root := newFixture(t)
 
 	for _, tt := range []struct {
-		name     string
-		builtins map[string]Builtin
-		want     string
+		name, line string
+		code       int
+		want       string
 	}{
-		{"with-help-to-point-at", builtinsNamed("help"), `unknown builtin "frobnicate"; try :help`},
-		{"without", nil, `unknown builtin "frobnicate"`},
+		{"history-needs-the-prompt", ":history", 1, "history: only at the prompt\n"},
+		{"history-is-bare-too", "history", 1, "history: only at the prompt\n"},
+		{"help-lists-the-session-s-own", ":help", 0, "  :history"},
+		{"help-is-bare-too", "help", 0, "  :history"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var out captured
 			code, err := Run(t.Context(), Config{
 				Instance:  "fake",
 				Dir:       root,
-				Command:   ":frobnicate",
+				Command:   tt.line,
 				Transport: local(),
-				Builtins:  tt.builtins,
 			}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 			require.NoError(t, err)
 
-			assert.Equal(t, statusBuiltinNotFound, code)
-			assert.Equal(t, tt.want+"\n", ansi.Strip(out.String()))
+			assert.Equal(t, tt.code, code)
+			assert.Contains(t, ansi.Strip(out.String()), tt.want)
 		})
 	}
+}
+
+func TestThePlatformsHelpComesFirst(t *testing.T) {
+	help := map[string]Builtin{
+		"help": BuiltinFunc(func(_ context.Context, streams Streams, _ []string) (int, error) {
+			fmt.Fprintln(streams.Stdout, "  :start     Start the instance.")
+			return 0, nil
+		}),
+	}
+
+	var out captured
+	code, err := Run(t.Context(), Config{
+		Instance:  "fake",
+		Dir:       newFixture(t),
+		Command:   ":help",
+		Transport: local(),
+		Builtins:  help,
+	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	require.NoError(t, err)
+
+	assert.Zero(t, code)
+	assert.Regexp(t, `(?s)^  :start .*\n  :history .*\nEverything else runs on the instance\.\n$`, out.String(),
+		"the platform lists its builtins, then the session its own")
 }
 
 func TestFailedCommandIsNotAShellFailure(t *testing.T) {
@@ -697,6 +773,13 @@ func TestASignalledHelperIsAFailureUnlessInterrupted(t *testing.T) {
 		"a helper killed because the statement was interrupted is not the redirection failing")
 }
 
+func TestASingleCommandLineSaysNothingExtra(t *testing.T) {
+	root := newFixture(t)
+
+	assert.Equal(t, "hello\n", runLine(t, root, "echo hello"),
+		"the banner is for a person at a prompt, not for a script")
+}
+
 func TestATruncationHappensBeforeTheCommandRuns(t *testing.T) {
 	root := newFixture(t)
 	boot := filepath.Join(root, "var", "log", "boot.log")
@@ -776,6 +859,47 @@ func TestFileTestsAskTheInstance(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "no-r\nno-w\nno-x\n", out.String())
+}
+
+func TestCaptureInterruptsHandsSIGINTBack(t *testing.T) {
+	var (
+		suspended []os.Signal
+		restored  bool
+	)
+	suspend := func(sig ...os.Signal) func() {
+		suspended = sig
+		return func() { restored = true }
+	}
+
+	s := &state{cfg: Config{SuspendSignals: suspend}, interrupts: make(chan os.Signal, 4)}
+	release := s.captureInterrupts()
+
+	// Registered after captureInterrupts so that a regression cannot leave
+	// SIGINT unhandled and kill this binary
+	guard := make(chan os.Signal, 1)
+	signal.Notify(guard, syscall.SIGINT)
+	defer signal.Stop(guard)
+
+	assert.Equal(t, []os.Signal{syscall.SIGINT}, suspended)
+
+	require.NoError(t, syscall.Kill(syscall.Getpid(), syscall.SIGINT))
+	select {
+	case <-s.interrupts:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the interrupt never reached the shell")
+	}
+
+	release()
+	assert.True(t, restored, "the signal was never handed back")
+}
+
+func TestCaptureInterruptsWithoutASuspend(t *testing.T) {
+	guard := make(chan os.Signal, 1)
+	signal.Notify(guard, syscall.SIGINT)
+	defer signal.Stop(guard)
+
+	s := &state{interrupts: make(chan os.Signal, 4)}
+	assert.NotPanics(t, s.captureInterrupts())
 }
 
 func TestStdinReachesTheCommand(t *testing.T) {
