@@ -26,6 +26,7 @@ use (
 	./sanitize
 	./signal
 	./startstopper
+	./stdio
 	./telemetry
 	./text
 	./version
