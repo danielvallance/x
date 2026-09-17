@@ -43,4 +43,5 @@ use (
 	./tools/openapi-gen
 	./tools/openapi-gen/examples
 	./tools/protoc-gen-go-struct
+	./tools/sh
 )
