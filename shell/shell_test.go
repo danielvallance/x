@@ -13,10 +13,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,7 +30,7 @@ import (
 	"unikraft.com/x/stdio"
 )
 
-func TestExitStatus(t *testing.T) {
+func TestCodeToExitStatus(t *testing.T) {
 	require.NoError(t, codeToExitStatus(0))
 
 	for _, tt := range []struct {
@@ -115,66 +113,13 @@ func TestReadDirEntries(t *testing.T) {
 // scripts/ go through it.
 // local is the test's transport: commands run here, and everything else is
 // asked of the instance's sh, as it is for any transport with no API of its own.
-func local() ExecTransport { return ExecTransport(localTransport{}.Exec) }
+func local() ExecTransport { return LocalTransport() }
 
 type scriptTransport string
 
-func (t scriptTransport) Exec(_ context.Context, streams stdio.Stdio, _ string, _ map[string]string, _ []string) (int, error) {
-	fmt.Fprint(streams.Stdout, string(t))
+func (t scriptTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	fmt.Fprint(cmd.Streams.Stdout, string(t))
 	return 0, nil
-}
-
-// localTransport stands in for an instance by running commands here. The shell
-// never learns the difference, so the routing, the remote filesystem handlers
-// and the session state can all be exercised without a network.
-type localTransport struct{}
-
-func (localTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	// Its own process group, as a command on the instance is: the terminal's
-	// own ^C reaches the shell, never the command.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Dir = dir
-	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH")}, sortedEnv(env)...)
-	cmd.Stdout, cmd.Stderr = streams.Stdout, streams.Stderr
-
-	// Stdin goes through a pipe the command's exit closes, as [Transport] asks:
-	// handed the reader itself, Wait would hold out for its EOF, which for the
-	// terminal only comes once the shell has this command's exit in hand.
-	if streams.Stdin != nil {
-		stdin, err := cmd.StdinPipe()
-		if err != nil {
-			return 0, err
-		}
-		defer stdin.Close()
-		go func() {
-			_, _ = io.Copy(stdin, streams.Stdin)
-			_ = stdin.Close()
-		}()
-	}
-
-	var exitErr *exec.ExitError
-	switch err := cmd.Run(); {
-	case err == nil:
-		return 0, nil
-	case errors.As(err, &exitErr):
-		// A signal is its number negated, as [Transport] asks.
-		if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-			return -int(status.Signal()), nil
-		}
-		return exitErr.ExitCode(), nil
-	default:
-		return 0, err
-	}
-}
-
-func sortedEnv(env map[string]string) []string {
-	out := make([]string, 0, len(env))
-	for k, v := range env {
-		out = append(out, k+"="+v)
-	}
-	slices.Sort(out)
-	return out
 }
 
 // echoBuiltins answer ":say <text>" by printing it, which is enough to see
@@ -341,10 +286,10 @@ func TestSessionHistory(t *testing.T) {
 // does once a command starts producing output.
 type chattyTransport struct{}
 
-func (chattyTransport) Exec(_ context.Context, streams stdio.Stdio, _ string, _ map[string]string, args []string) (int, error) {
+func (chattyTransport) Exec(_ context.Context, cmd Command) (int, error) {
 	for i := range 50 {
-		fmt.Fprintf(streams.Stdout, "%s-out-%d\n", args[0], i)
-		fmt.Fprintf(streams.Stderr, "%s-err-%d\n", args[0], i)
+		fmt.Fprintf(cmd.Streams.Stdout, "%s-out-%d\n", cmd.Args[0], i)
+		fmt.Fprintf(cmd.Streams.Stderr, "%s-err-%d\n", cmd.Args[0], i)
 	}
 	return 0, nil
 }
@@ -434,7 +379,7 @@ func TestEnvironment(t *testing.T) {
 // given.
 type deadlineTransport struct{ deadline bool }
 
-func (t *deadlineTransport) Exec(ctx context.Context, _ stdio.Stdio, _ string, _ map[string]string, _ []string) (int, error) {
+func (t *deadlineTransport) Exec(ctx context.Context, _ Command) (int, error) {
 	_, t.deadline = ctx.Deadline()
 	return 0, nil
 }
@@ -462,17 +407,17 @@ func TestEveryProbeIsBounded(t *testing.T) {
 
 // slowStatTransport is an instance that answers what is at a path more slowly
 // than a probe is given to wait.
-type slowStatTransport struct{ localTransport }
+type slowStatTransport struct{}
 
-func (t slowStatTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
-	if len(args) > 2 && args[2] == statScript {
+func (t slowStatTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if len(cmd.Args) > 2 && cmd.Args[2] == statScript {
 		select {
 		case <-time.After(instanceProbeTimeout + 200*time.Millisecond):
 		case <-ctx.Done():
 			return 0, ctx.Err()
 		}
 	}
-	return t.localTransport.Exec(ctx, streams, dir, env, args)
+	return local().Exec(ctx, cmd)
 }
 
 func TestASlowInstanceDoesNotLoseItsFiles(t *testing.T) {
@@ -495,7 +440,7 @@ func TestASlowInstanceDoesNotLoseItsFiles(t *testing.T) {
 // opposed to one that runs a command and reports a failure.
 type unreachableTransport struct{ calls int }
 
-func (t *unreachableTransport) Exec(context.Context, stdio.Stdio, string, map[string]string, []string) (int, error) {
+func (t *unreachableTransport) Exec(context.Context, Command) (int, error) {
 	t.calls++
 	return 0, errors.New("504 Gateway Time-out")
 }
@@ -670,7 +615,7 @@ type exitTransport struct {
 	err  error
 }
 
-func (t exitTransport) Exec(context.Context, stdio.Stdio, string, map[string]string, []string) (int, error) {
+func (t exitTransport) Exec(context.Context, Command) (int, error) {
 	return t.code, t.err
 }
 
@@ -1081,13 +1026,13 @@ func TestNewerThanAsksTheInstance(t *testing.T) {
 }
 
 // noShellTransport is an instance with no sh: commands run by argv, the helpers do not.
-type noShellTransport struct{ localTransport }
+type noShellTransport struct{}
 
-func (t noShellTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
-	if args[0] == "sh" {
+func (t noShellTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if cmd.Args[0] == "sh" {
 		return statusBuiltinNotFound, nil
 	}
-	return t.localTransport.Exec(ctx, streams, dir, env, args)
+	return local().Exec(ctx, cmd)
 }
 
 func TestAnInstanceWithoutAShellSaysSoOnFiles(t *testing.T) {
@@ -1110,8 +1055,8 @@ func TestAnInstanceWithoutAShellSaysSoOnFiles(t *testing.T) {
 // complainingTransport fails every helper with a word about why.
 type complainingTransport struct{}
 
-func (complainingTransport) Exec(_ context.Context, streams stdio.Stdio, _ string, _ map[string]string, _ []string) (int, error) {
-	fmt.Fprintln(streams.Stderr, "sh: out of memory")
+func (complainingTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	fmt.Fprintln(cmd.Streams.Stderr, "sh: out of memory")
 	return 2, nil
 }
 

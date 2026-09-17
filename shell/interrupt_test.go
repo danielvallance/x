@@ -18,8 +18,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
-
-	"unikraft.com/x/stdio"
 )
 
 const blockingCommand = "block"
@@ -39,13 +37,13 @@ func newHaltingTransport() *haltingTransport {
 	return &haltingTransport{started: make(chan struct{})}
 }
 
-func (t *haltingTransport) Exec(ctx context.Context, _ stdio.Stdio, _ string, _ map[string]string, args []string) (int, error) {
+func (t *haltingTransport) Exec(ctx context.Context, cmd Command) (int, error) {
 	t.mu.Lock()
-	t.ran = append(t.ran, strings.Join(args, " "))
+	t.ran = append(t.ran, strings.Join(cmd.Args, " "))
 	t.detached = append(t.detached, IsDetached(ctx))
 	t.mu.Unlock()
 
-	if args[0] != blockingCommand {
+	if cmd.Args[0] != blockingCommand {
 		return 0, nil
 	}
 	t.starting.Do(func() { close(t.started) })
@@ -127,7 +125,7 @@ func status(t *testing.T, s *state, out *captured) string {
 	t.Helper()
 
 	before := len(out.String())
-	_, err := exitStatus(s.runner.Run(t.Context(), &syntax.File{
+	_, err := interpStatus(s.runner.Run(t.Context(), &syntax.File{
 		Stmts: parseShell(t, `printf 'status=%s' "$?"`),
 	}))
 	require.NoError(t, err)

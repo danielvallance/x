@@ -50,10 +50,10 @@ func probing(ctx context.Context) (context.Context, context.CancelFunc) {
 
 // ExecTransport answers all of it through sh on the instance, given only a way
 // to run a command.
-type ExecTransport func(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error)
+type ExecTransport func(ctx context.Context, cmd Command) (int, error)
 
-func (e ExecTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
-	return e(ctx, streams, dir, env, args)
+func (e ExecTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	return e(ctx, cmd)
 }
 
 func (e ExecTransport) Stat(ctx context.Context, dir, name string, followSymlinks bool) (fs.FileInfo, error) {
@@ -177,8 +177,11 @@ func (e ExecTransport) Environ(ctx context.Context) ([]string, error) {
 		probeCtx, cancel := probing(ctx)
 
 		var code int
-		code, err = e(probeCtx, stdio.Stdio{Stdout: &out, Stderr: io.Discard}, probeDir, nil,
-			[]string{"sh", "-c", environProbe})
+		code, err = e(probeCtx, Command{
+			Args:    []string{"sh", "-c", environProbe},
+			Dir:     probeDir,
+			Streams: stdio.Stdio{Stdout: &out, Stderr: io.Discard},
+		})
 		cancel()
 
 		switch {
@@ -342,8 +345,11 @@ func (e ExecTransport) redirect(ctx context.Context, op, p, snippet string, stre
 	var errOut bytes.Buffer
 	streams.Stderr = &errOut
 
-	code, err := e(ctx, streams, probeDir, nil,
-		[]string{"sh", "-c", snippet, "sh", p})
+	code, err := e(ctx, Command{
+		Args:    []string{"sh", "-c", snippet, "sh", p},
+		Dir:     probeDir,
+		Streams: streams,
+	})
 	switch {
 	case err != nil:
 		return &fs.PathError{Op: op, Path: p, Err: err}
@@ -373,8 +379,11 @@ func redirectError(errOut *bytes.Buffer) error {
 func (e ExecTransport) script(ctx context.Context, snippet string, args ...string) (string, error) {
 	var out, errOut bytes.Buffer
 
-	code, err := e(ctx, stdio.Stdio{Stdout: &out, Stderr: &errOut}, probeDir, nil,
-		append([]string{"sh", "-c", snippet, "sh"}, args...))
+	code, err := e(ctx, Command{
+		Args:    append([]string{"sh", "-c", snippet, "sh"}, args...),
+		Dir:     probeDir,
+		Streams: stdio.Stdio{Stdout: &out, Stderr: &errOut},
+	})
 	switch {
 	case err != nil:
 		return "", err

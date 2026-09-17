@@ -141,16 +141,15 @@ func TestTheTerminalShowsThroughTheConsole(t *testing.T) {
 // helperTransport runs everything here, except the helper whose script contains
 // marker: that one is answered by answer.
 type helperTransport struct {
-	localTransport
 	marker string
 	answer func(ctx context.Context, streams stdio.Stdio) (int, error)
 }
 
-func (t helperTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
-	if len(args) > 2 && args[0] == "sh" && strings.Contains(args[2], t.marker) {
-		return t.answer(ctx, streams)
+func (t helperTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if len(cmd.Args) > 2 && cmd.Args[0] == "sh" && strings.Contains(cmd.Args[2], t.marker) {
+		return t.answer(ctx, cmd.Streams)
 	}
-	return t.localTransport.Exec(ctx, streams, dir, env, args)
+	return local().Exec(ctx, cmd)
 }
 
 // crlf turns every newline written through it into CRLF, as a pty would.
@@ -167,7 +166,11 @@ func TestAWriteAckMayEndInCRLF(t *testing.T) {
 
 	transport := helperTransport{marker: "3>", answer: func(ctx context.Context, streams stdio.Stdio) (int, error) {
 		streams.Stdout = crlf{streams.Stdout}
-		return local().Exec(ctx, streams, root, nil, []string{"sh", "-c", writeScript, "sh", out})
+		return local().Exec(ctx, Command{
+			Args:    []string{"sh", "-c", writeScript, "sh", out},
+			Dir:     root,
+			Streams: streams,
+		})
 	}}
 
 	var buf captured
@@ -302,13 +305,13 @@ func TestAFailingBuiltinReportsItsError(t *testing.T) {
 
 // droppingTransport reaches the instance for the helpers but loses the
 // connection under every command.
-type droppingTransport struct{ localTransport }
+type droppingTransport struct{}
 
-func (t droppingTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
-	if args[0] != "sh" {
+func (t droppingTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if cmd.Args[0] != "sh" {
 		return 0, errors.New("connection reset by peer")
 	}
-	return t.localTransport.Exec(ctx, streams, dir, env, args)
+	return local().Exec(ctx, cmd)
 }
 
 func TestACommandTheTransportLosesIsAFailedCommand(t *testing.T) {

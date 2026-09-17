@@ -68,7 +68,12 @@ func (s *state) runRemote(ctx context.Context, args []string) error {
 	// context's watcher gets around to it.
 	defer reclaim()
 
-	code, err := s.cfg.Transport.Exec(ctx, streams, hc.Dir, envToMap(hc.Env), args)
+	code, err := s.cfg.Transport.Exec(ctx, Command{
+		Args:    args,
+		Dir:     hc.Dir,
+		Env:     envList(hc.Env),
+		Streams: streams,
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			return interp.ExitStatus(StatusInterrupted)
@@ -150,14 +155,15 @@ func (s *state) commandStdin(ctx context.Context, in io.Reader) (io.Reader, func
 	return in, func() {}
 }
 
-func envToMap(env expand.Environ) map[string]string {
-	vars := map[string]string{}
+func envList(env expand.Environ) []string {
+	var vars []string
 	env.Each(func(name string, vr expand.Variable) bool {
 		if vr.Exported && vr.IsSet() {
-			vars[name] = vr.String()
+			vars = append(vars, name+"="+vr.String())
 		}
 		return true
 	})
+	slices.Sort(vars)
 	return vars
 }
 

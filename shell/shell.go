@@ -178,11 +178,11 @@ func (s *state) runSource(ctx context.Context, src io.Reader) (int, error) {
 	if err := unsupported(prog); err != nil {
 		return 0, err
 	}
-	return exitStatus(s.runner.Run(ctx, prog))
+	return interpStatus(s.runner.Run(ctx, prog))
 }
 
-// exitStatus separates a command's exit status from the interpreter failing.
-func exitStatus(err error) (int, error) {
+// interpStatus separates a command's exit status from the interpreter failing.
+func interpStatus(err error) (int, error) {
 	if status, ok := errors.AsType[interp.ExitStatus](err); ok {
 		return int(status), nil
 	}
@@ -357,7 +357,7 @@ func (s *state) runStmt(ctx context.Context, stmt *syntax.Stmt) (status int, int
 		}
 	})
 
-	status, err = exitStatus(s.runner.Run(stmtCtx, stmt))
+	status, err = interpStatus(s.runner.Run(stmtCtx, stmt))
 	stop()
 
 	if !hit.Load() {

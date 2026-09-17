@@ -7,8 +7,6 @@ package shell
 
 import (
 	"context"
-	"io"
-	"io/fs"
 	"os"
 
 	"unikraft.com/x/stdio"
@@ -29,36 +27,6 @@ type Config struct {
 
 // SuspendFunc lends the shell a signal for as long as it holds the prompt; x/signal's Signals.Suspend is one.
 type SuspendFunc func(sig ...os.Signal) (restore func())
-
-// Transport is how the shell reaches the instance.
-type Transport interface {
-	// Exec runs one command, its status negated when it was signalled
-	Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error)
-
-	// Stat is what is at a path, the symlink itself when not following
-	Stat(ctx context.Context, dir, name string, followSymlinks bool) (fs.FileInfo, error)
-
-	// Access is whether the file can be used every way mode asks
-	Access(ctx context.Context, dir, name string, mode AccessMode) error
-
-	// ReadDir lists a directory, by name
-	ReadDir(ctx context.Context, dir, name string) ([]fs.DirEntry, error)
-
-	// Open streams a file one way, telling stderr what goes wrong after
-	Open(ctx context.Context, dir, name string, flag int, stderr io.Writer) (io.ReadWriteCloser, error)
-
-	// Environ is the instance's own environment, as NAME=value
-	Environ(ctx context.Context) ([]string, error)
-}
-
-// AccessMode is what a caller wants to do with a file.
-type AccessMode uint8
-
-const (
-	AccessRead AccessMode = 1 << iota
-	AccessWrite
-	AccessExec
-)
 
 // Builtin answers one ":" line here, not on the instance; args[0] is its name.
 type Builtin interface {
