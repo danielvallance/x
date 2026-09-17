@@ -55,12 +55,21 @@ tasks:
     - git add -A -- .
     - git diff --cached --exit-code -- .
 
+  kraftfile-schema-check:
+    desc: "Verify kraftfile/schema.json is regenerated from the Go spec"
+    dir: kraftfile
+    cmds:
+    - go generate ./...
+    - git add -A -- .
+    - git diff --cached --exit-code -- .
+
   # ci tasks
 
   ci/check:
   - task: forall
     vars: { gotask: static-check }
   - task: openapi-gen-examples-check
+  - task: kraftfile-schema-check
 
   ci/test:
   - task: forall
