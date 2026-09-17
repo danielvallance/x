@@ -32,6 +32,7 @@ import (
 
 	xio "unikraft.com/x/io"
 	"unikraft.com/x/log"
+	"unikraft.com/x/stdio"
 )
 
 const (
@@ -90,7 +91,7 @@ func (s *state) dir() string {
 	return s.runner.Dir
 }
 
-func Run(ctx context.Context, cfg Config, streams Streams) (int, error) {
+func Run(ctx context.Context, cfg Config, streams stdio.Stdio) (int, error) {
 	s, err := newState(ctx, cfg, streams)
 	if err != nil {
 		return 0, err
@@ -110,7 +111,7 @@ func Run(ctx context.Context, cfg Config, streams Streams) (int, error) {
 
 // newState initializes the streams it writes on, the instance's environment,
 // and the interpreter over both.
-func newState(ctx context.Context, cfg Config, streams Streams) (*state, error) {
+func newState(ctx context.Context, cfg Config, streams stdio.Stdio) (*state, error) {
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("no transport to the instance")
 	}

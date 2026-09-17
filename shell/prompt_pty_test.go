@@ -23,6 +23,8 @@ import (
 	"github.com/creack/pty"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"unikraft.com/x/stdio"
 )
 
 // helperEnv puts the test binary into a mode where it is the shell itself,
@@ -46,7 +48,7 @@ func runHelperSession(root string) int {
 		Transport: local(),
 		Builtins:  builtinsNamed("start"),
 		Banner:    "this shell is experimental\nno job control, so no ctrl-z, bg or fg",
-	}, Streams{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
+	}, stdio.Stdio{Stdin: os.Stdin, Stdout: os.Stdout, Stderr: os.Stderr})
 	switch {
 	case errors.Is(err, context.Canceled):
 		// Told to leave, and did: what the CLI treats as a clean exit too.
@@ -67,7 +69,7 @@ func TestPromptNeedsTheProcessTerminal(t *testing.T) {
 		Instance:  "fake",
 		Dir:       newFixture(t),
 		Transport: local(),
-	}, Streams{Stdin: tty, Stdout: tty, Stderr: tty})
+	}, stdio.Stdio{Stdin: tty, Stdout: tty, Stderr: tty})
 	require.ErrorIs(t, err, errNotProcessTerminal)
 }
 

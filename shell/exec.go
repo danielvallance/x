@@ -15,6 +15,8 @@ import (
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
+
+	"unikraft.com/x/stdio"
 )
 
 const (
@@ -59,7 +61,7 @@ func (s *state) runRemote(ctx context.Context, args []string) error {
 	ctx, done := context.WithCancel(ctx)
 	defer done()
 
-	streams := Streams{Stdin: hc.Stdin, Stdout: hc.Stdout, Stderr: hc.Stderr}
+	streams := stdio.Stdio{Stdin: hc.Stdin, Stdout: hc.Stdout, Stderr: hc.Stderr}
 	in, reclaim := s.commandStdin(ctx, streams.Stdin)
 	streams.Stdin = in
 	// Hand the terminal back before the prompt reads it again, not whenever the
@@ -79,7 +81,7 @@ func (s *state) runRemote(ctx context.Context, args []string) error {
 
 func (s *state) runBuiltin(ctx context.Context, args []string) error {
 	hc := interp.HandlerCtx(ctx)
-	streams := Streams{Stdin: hc.Stdin, Stdout: hc.Stdout, Stderr: hc.Stderr}
+	streams := stdio.Stdio{Stdin: hc.Stdin, Stdout: hc.Stdout, Stderr: hc.Stderr}
 
 	args = append([]string{strings.TrimPrefix(args[0], BuiltinMarker)}, args[1:]...)
 	if slices.Contains(sessionBuiltinNames, args[0]) {
@@ -114,7 +116,7 @@ func unknownBuiltin(name string) string {
 	return fmt.Sprintf("unknown builtin %q; try %s%s", name, BuiltinMarker, helpBuiltin)
 }
 
-func (s *state) runSessionBuiltin(streams Streams, args []string) error {
+func (s *state) runSessionBuiltin(streams stdio.Stdio, args []string) error {
 	switch args[0] {
 	case "history":
 		if s.history == nil {

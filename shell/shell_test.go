@@ -28,6 +28,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"mvdan.cc/sh/v3/interp"
+
+	"unikraft.com/x/stdio"
 )
 
 func TestExitStatus(t *testing.T) {
@@ -117,7 +119,7 @@ func local() ExecTransport { return ExecTransport(localTransport{}.Exec) }
 
 type scriptTransport string
 
-func (t scriptTransport) Exec(_ context.Context, streams Streams, _ string, _ map[string]string, _ []string) (int, error) {
+func (t scriptTransport) Exec(_ context.Context, streams stdio.Stdio, _ string, _ map[string]string, _ []string) (int, error) {
 	fmt.Fprint(streams.Stdout, string(t))
 	return 0, nil
 }
@@ -127,7 +129,7 @@ func (t scriptTransport) Exec(_ context.Context, streams Streams, _ string, _ ma
 // and the session state can all be exercised without a network.
 type localTransport struct{}
 
-func (localTransport) Exec(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error) {
+func (localTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	// Its own process group, as a command on the instance is: the terminal's
 	// own ^C reaches the shell, never the command.
@@ -178,7 +180,7 @@ func sortedEnv(env map[string]string) []string {
 // echoBuiltins answer ":say <text>" by printing it, which is enough to see
 // where a builtin's output ends up.
 var echoBuiltins = map[string]Builtin{
-	"say": BuiltinFunc(func(_ context.Context, streams Streams, args []string) (int, error) {
+	"say": BuiltinFunc(func(_ context.Context, streams stdio.Stdio, args []string) (int, error) {
 		fmt.Fprintln(streams.Stdout, strings.Join(args[1:], " "))
 		return 0, nil
 	}),
@@ -188,7 +190,7 @@ var echoBuiltins = map[string]Builtin{
 func builtinsNamed(names ...string) map[string]Builtin {
 	builtins := map[string]Builtin{}
 	for _, name := range names {
-		builtins[name] = BuiltinFunc(func(_ context.Context, _ Streams, args []string) (int, error) {
+		builtins[name] = BuiltinFunc(func(_ context.Context, _ stdio.Stdio, args []string) (int, error) {
 			return 0, fmt.Errorf("%s is not implemented", args[0])
 		})
 	}
@@ -245,7 +247,7 @@ func runLine(t *testing.T, root, line string) string {
 		Dir:       root,
 		Command:   line,
 		Transport: local(),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err, "output: %s", out.String())
 
 	return out.String()
@@ -323,14 +325,14 @@ func TestSessionHistory(t *testing.T) {
 	}
 
 	var out captured
-	require.NoError(t, s.runSessionBuiltin(Streams{Stdout: &out, Stderr: &out}, []string{"history"}))
+	require.NoError(t, s.runSessionBuiltin(stdio.Stdio{Stdout: &out, Stderr: &out}, []string{"history"}))
 	assert.Equal(t, "    1  echo one\n    2  echo two\n", out.String())
 
 	assert.Equal(t, []string{"history", "start"}, s.builtinNames())
 
 	bare := &state{}
 	out.Reset()
-	err := bare.runSessionBuiltin(Streams{Stdout: &out, Stderr: &out}, []string{"history"})
+	err := bare.runSessionBuiltin(stdio.Stdio{Stdout: &out, Stderr: &out}, []string{"history"})
 	assert.Equal(t, interp.ExitStatus(1), err, "no prompt, no history to show")
 	assert.Contains(t, out.String(), "only at the prompt")
 }
@@ -339,7 +341,7 @@ func TestSessionHistory(t *testing.T) {
 // does once a command starts producing output.
 type chattyTransport struct{}
 
-func (chattyTransport) Exec(_ context.Context, streams Streams, _ string, _ map[string]string, args []string) (int, error) {
+func (chattyTransport) Exec(_ context.Context, streams stdio.Stdio, _ string, _ map[string]string, args []string) (int, error) {
 	for i := range 50 {
 		fmt.Fprintf(streams.Stdout, "%s-out-%d\n", args[0], i)
 		fmt.Fprintf(streams.Stderr, "%s-err-%d\n", args[0], i)
@@ -355,7 +357,7 @@ func TestConcurrentCommandsShareTheTerminal(t *testing.T) {
 		Dir:       "/",
 		Command:   "alpha | beta",
 		Transport: ExecTransport(chattyTransport{}.Exec),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Contains(t, out.String(), "beta-out-49")
@@ -375,7 +377,7 @@ func TestBuiltinsCompose(t *testing.T) {
 			Command:   line,
 			Transport: local(),
 			Builtins:  echoBuiltins,
-		}, Streams{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
+		}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
 		require.NoError(t, err)
 
 		return buf.String()
@@ -422,7 +424,7 @@ func TestEnvironment(t *testing.T) {
 		Env:       map[string]string{"GREETING": "hi"},
 		Command:   `echo "$GREETING $PWD"; env | grep -c '^PATH='`,
 		Transport: local(),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Equal(t, "hi "+root+"\n1\n", out.String())
@@ -432,7 +434,7 @@ func TestEnvironment(t *testing.T) {
 // given.
 type deadlineTransport struct{ deadline bool }
 
-func (t *deadlineTransport) Exec(ctx context.Context, _ Streams, _ string, _ map[string]string, _ []string) (int, error) {
+func (t *deadlineTransport) Exec(ctx context.Context, _ stdio.Stdio, _ string, _ map[string]string, _ []string) (int, error) {
 	_, t.deadline = ctx.Deadline()
 	return 0, nil
 }
@@ -462,7 +464,7 @@ func TestEveryProbeIsBounded(t *testing.T) {
 // than a probe is given to wait.
 type slowStatTransport struct{ localTransport }
 
-func (t slowStatTransport) Exec(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error) {
+func (t slowStatTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
 	if len(args) > 2 && args[2] == statScript {
 		select {
 		case <-time.After(instanceProbeTimeout + 200*time.Millisecond):
@@ -482,7 +484,7 @@ func TestASlowInstanceDoesNotLoseItsFiles(t *testing.T) {
 		Dir:       root,
 		Command:   "[ -f hostname ] && echo found || echo missing",
 		Transport: ExecTransport(slowStatTransport{}.Exec),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Equal(t, "found\n", out.String(),
@@ -493,7 +495,7 @@ func TestASlowInstanceDoesNotLoseItsFiles(t *testing.T) {
 // opposed to one that runs a command and reports a failure.
 type unreachableTransport struct{ calls int }
 
-func (t *unreachableTransport) Exec(context.Context, Streams, string, map[string]string, []string) (int, error) {
+func (t *unreachableTransport) Exec(context.Context, stdio.Stdio, string, map[string]string, []string) (int, error) {
 	t.calls++
 	return 0, errors.New("504 Gateway Time-out")
 }
@@ -507,7 +509,7 @@ func TestUnreachableInstanceIsNotAPrompt(t *testing.T) {
 		Dir:       "/",
 		Command:   "echo unreachable",
 		Transport: ExecTransport(probe.Exec),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "could not reach sandbox")
@@ -557,7 +559,7 @@ func TestShellNeedsATerminal(t *testing.T) {
 		Instance:  "fake",
 		Dir:       root,
 		Transport: local(),
-	}, Streams{
+	}, stdio.Stdio{
 		Stdin:  strings.NewReader("cd var/log\nls\n"),
 		Stdout: &out,
 		Stderr: &out,
@@ -574,7 +576,7 @@ func TestAnUnknownBuiltinIsNamed(t *testing.T) {
 		Dir:       newFixture(t),
 		Command:   ":frobnicate",
 		Transport: local(),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Equal(t, statusBuiltinNotFound, code)
@@ -589,7 +591,7 @@ func TestSessionBuiltinNamesAreReserved(t *testing.T) {
 		Dir:       newFixture(t),
 		Transport: local(),
 		Builtins:  builtinsNamed("start", "history"),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.ErrorContains(t, err, `"history"`)
 
 	assert.Empty(t, out.String())
@@ -615,7 +617,7 @@ func TestSessionBuiltinsOutsideThePrompt(t *testing.T) {
 				Dir:       root,
 				Command:   tt.line,
 				Transport: local(),
-			}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+			}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.code, code)
@@ -626,7 +628,7 @@ func TestSessionBuiltinsOutsideThePrompt(t *testing.T) {
 
 func TestThePlatformsHelpComesFirst(t *testing.T) {
 	help := map[string]Builtin{
-		"help": BuiltinFunc(func(_ context.Context, streams Streams, _ []string) (int, error) {
+		"help": BuiltinFunc(func(_ context.Context, streams stdio.Stdio, _ []string) (int, error) {
 			fmt.Fprintln(streams.Stdout, "  :start     Start the instance.")
 			return 0, nil
 		}),
@@ -639,7 +641,7 @@ func TestThePlatformsHelpComesFirst(t *testing.T) {
 		Command:   ":help",
 		Transport: local(),
 		Builtins:  help,
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Zero(t, code)
@@ -656,7 +658,7 @@ func TestFailedCommandIsNotAShellFailure(t *testing.T) {
 		Dir:       root,
 		Command:   "false",
 		Transport: local(),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 
 	require.NoError(t, err, "a failing command is not the shell failing")
 	assert.Equal(t, 1, code, "but its status is the session's to report")
@@ -668,7 +670,7 @@ type exitTransport struct {
 	err  error
 }
 
-func (t exitTransport) Exec(context.Context, Streams, string, map[string]string, []string) (int, error) {
+func (t exitTransport) Exec(context.Context, stdio.Stdio, string, map[string]string, []string) (int, error) {
 	return t.code, t.err
 }
 
@@ -762,14 +764,14 @@ func TestAFailedRedirectionStopsTheCommand(t *testing.T) {
 func TestASignalledHelperIsAFailureUnlessInterrupted(t *testing.T) {
 	s := ExecTransport(exitTransport{code: -int(syscall.SIGKILL)}.Exec)
 
-	err := s.redirect(t.Context(), "write", "/tmp/out", writeScript, Streams{})
+	err := s.redirect(t.Context(), "write", "/tmp/out", writeScript, stdio.Stdio{})
 	require.ErrorContains(t, err, "signalled (9)",
 		"a helper killed under a live statement lost data; that cannot look like success")
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	assert.NoError(t, s.redirect(ctx, "write", "/tmp/out", writeScript, Streams{}),
+	assert.NoError(t, s.redirect(ctx, "write", "/tmp/out", writeScript, stdio.Stdio{}),
 		"a helper killed because the statement was interrupted is not the redirection failing")
 }
 
@@ -813,7 +815,7 @@ func TestAStreamCanBeRedirectedFrom(t *testing.T) {
 			Dir:       root,
 			Command:   "head -1 < " + fifo,
 			Transport: local(),
-		}, Streams{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
+		}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
 		done <- buf.String()
 	}()
 
@@ -855,7 +857,7 @@ func TestFileTestsAskTheInstance(t *testing.T) {
 		Dir:       "/",
 		Command:   `[ -r /etc/hosts ] || echo no-r; [ -w /tmp ] || echo no-w; [ -x /bin/sh ] || echo no-x`,
 		Transport: ExecTransport(exitTransport{code: 1}.Exec),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Equal(t, "no-r\nno-w\nno-x\n", out.String())
@@ -911,7 +913,7 @@ func TestStdinReachesTheCommand(t *testing.T) {
 		Dir:       root,
 		Command:   "cat",
 		Transport: local(),
-	}, Streams{Stdin: strings.NewReader("payload\n"), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader("payload\n"), Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Equal(t, "payload\n", out.String())
@@ -929,7 +931,7 @@ func TestTheInputIsLentToTheCommand(t *testing.T) {
 		Command:   "head -1",
 		Transport: local(),
 		Input:     keys,
-	}, Streams{Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Equal(t, "payload\n", out.String())
@@ -985,7 +987,7 @@ func TestTheInterpreterReadsTheTerminal(t *testing.T) {
 		Dir:       newFixture(t),
 		Command:   "read x; echo got:$x",
 		Transport: local(),
-	}, Streams{Stdin: tty, Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: tty, Stdout: &out, Stderr: &out})
 	require.NoError(t, err)
 
 	assert.Equal(t, "got:hello\n", out.String(), "read is a builtin, so it is the interpreter's stdin that must be the terminal")
@@ -1006,7 +1008,7 @@ func TestARemoteCommandGivesTheTerminalBack(t *testing.T) {
 			Dir:       root,
 			Command:   "/bin/echo remote-ok",
 			Transport: local(),
-		}, Streams{Stdin: tty, Stdout: &out, Stderr: &out})
+		}, stdio.Stdio{Stdin: tty, Stdout: &out, Stderr: &out})
 		returned <- err
 	}()
 
@@ -1059,7 +1061,7 @@ func TestWhatOnlyThisMachineCouldAnswerIsRefused(t *testing.T) {
 				Dir:       root,
 				Command:   tt.line,
 				Transport: local(),
-			}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+			}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 			require.ErrorContains(t, err, tt.want)
 			assert.Empty(t, out.String(), "refused before anything ran")
 		})
@@ -1081,7 +1083,7 @@ func TestNewerThanAsksTheInstance(t *testing.T) {
 // noShellTransport is an instance with no sh: commands run by argv, the helpers do not.
 type noShellTransport struct{ localTransport }
 
-func (t noShellTransport) Exec(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error) {
+func (t noShellTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
 	if args[0] == "sh" {
 		return statusBuiltinNotFound, nil
 	}
@@ -1097,7 +1099,7 @@ func TestAnInstanceWithoutAShellSaysSoOnFiles(t *testing.T) {
 		Dir:       root,
 		Command:   "echo runs; cat < var/log/app.log",
 		Transport: ExecTransport(noShellTransport{}.Exec),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out})
 	require.NoError(t, err, "the session opens, commands run by argv")
 
 	assert.Equal(t, 1, code)
@@ -1108,7 +1110,7 @@ func TestAnInstanceWithoutAShellSaysSoOnFiles(t *testing.T) {
 // complainingTransport fails every helper with a word about why.
 type complainingTransport struct{}
 
-func (complainingTransport) Exec(_ context.Context, streams Streams, _ string, _ map[string]string, _ []string) (int, error) {
+func (complainingTransport) Exec(_ context.Context, streams stdio.Stdio, _ string, _ map[string]string, _ []string) (int, error) {
 	fmt.Fprintln(streams.Stderr, "sh: out of memory")
 	return 2, nil
 }

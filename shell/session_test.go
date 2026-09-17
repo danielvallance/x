@@ -15,6 +15,8 @@ import (
 	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"unikraft.com/x/stdio"
 )
 
 // newDrivenSession is a session a caller drives, with the write end of the
@@ -35,7 +37,7 @@ func newDrivenSession(t *testing.T, cfg Config) (*Session, *os.File, *captured) 
 		cfg.Transport = local()
 	}
 
-	s, err := New(t.Context(), cfg, Streams{Stdout: out, Stderr: out})
+	s, err := New(t.Context(), cfg, stdio.Stdio{Stdout: out, Stderr: out})
 	require.NoError(t, err)
 	return s, pw, out
 }
@@ -228,14 +230,14 @@ func TestSessionPaintsWhatTheCallerAsksFor(t *testing.T) {
 }
 
 func TestASessionIsNotACommandLine(t *testing.T) {
-	_, err := New(t.Context(), Config{Transport: local(), Command: "echo hi"}, Streams{})
+	_, err := New(t.Context(), Config{Transport: local(), Command: "echo hi"}, stdio.Stdio{})
 	require.ErrorContains(t, err, "not cfg.Command")
 
 	_, err = New(t.Context(), Config{Transport: local()},
-		Streams{Stdin: strings.NewReader("")})
+		stdio.Stdio{Stdin: strings.NewReader("")})
 	require.ErrorContains(t, err, "not streams.Stdin")
 
-	_, err = New(t.Context(), Config{}, Streams{})
+	_, err = New(t.Context(), Config{}, stdio.Stdio{})
 	require.ErrorContains(t, err, "no transport")
 }
 

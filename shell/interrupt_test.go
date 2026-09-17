@@ -18,6 +18,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
+
+	"unikraft.com/x/stdio"
 )
 
 const blockingCommand = "block"
@@ -37,7 +39,7 @@ func newHaltingTransport() *haltingTransport {
 	return &haltingTransport{started: make(chan struct{})}
 }
 
-func (t *haltingTransport) Exec(ctx context.Context, _ Streams, _ string, _ map[string]string, args []string) (int, error) {
+func (t *haltingTransport) Exec(ctx context.Context, _ stdio.Stdio, _ string, _ map[string]string, args []string) (int, error) {
 	t.mu.Lock()
 	t.ran = append(t.ran, strings.Join(args, " "))
 	t.detached = append(t.detached, IsDetached(ctx))

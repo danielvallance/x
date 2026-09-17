@@ -30,13 +30,10 @@ type Config struct {
 // SuspendFunc lends the shell a signal for as long as it holds the prompt; x/signal's Signals.Suspend is one.
 type SuspendFunc func(sig ...os.Signal) (restore func())
 
-// Streams are the three standard streams a single command is wired to.
-type Streams = stdio.Stdio
-
 // Transport is how the shell reaches the instance.
 type Transport interface {
 	// Exec runs one command, its status negated when it was signalled
-	Exec(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error)
+	Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error)
 
 	// Stat is what is at a path, the symlink itself when not following
 	Stat(ctx context.Context, dir, name string, followSymlinks bool) (fs.FileInfo, error)
@@ -65,12 +62,12 @@ const (
 
 // Builtin answers one ":" line here, not on the instance; args[0] is its name.
 type Builtin interface {
-	Run(ctx context.Context, streams Streams, args []string) (int, error)
+	Run(ctx context.Context, streams stdio.Stdio, args []string) (int, error)
 }
 
 // BuiltinFunc is a Builtin made of a function.
-type BuiltinFunc func(ctx context.Context, streams Streams, args []string) (int, error)
+type BuiltinFunc func(ctx context.Context, streams stdio.Stdio, args []string) (int, error)
 
-func (f BuiltinFunc) Run(ctx context.Context, streams Streams, args []string) (int, error) {
+func (f BuiltinFunc) Run(ctx context.Context, streams stdio.Stdio, args []string) (int, error) {
 	return f(ctx, streams, args)
 }

@@ -9,6 +9,8 @@ import (
 	"context"
 	"fmt"
 	"syscall"
+
+	"unikraft.com/x/stdio"
 )
 
 // Session is a shell a caller drives a line at a time, bringing its own line
@@ -21,7 +23,7 @@ type Session struct {
 // *colorprofile.Writer: it is what brings the prompt and a command's own
 // colours down to what the far end can show, and without one the profile is
 // this process' environment, a server's and not a terminal's.
-func New(ctx context.Context, cfg Config, streams Streams) (*Session, error) {
+func New(ctx context.Context, cfg Config, streams stdio.Stdio) (*Session, error) {
 	if cfg.Command != "" {
 		return nil, fmt.Errorf("a session runs the lines it is given, not cfg.Command")
 	}

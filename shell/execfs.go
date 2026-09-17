@@ -24,6 +24,7 @@ import (
 
 	xio "unikraft.com/x/io"
 	"unikraft.com/x/log"
+	"unikraft.com/x/stdio"
 )
 
 const (
@@ -49,9 +50,9 @@ func probing(ctx context.Context) (context.Context, context.CancelFunc) {
 
 // ExecTransport answers all of it through sh on the instance, given only a way
 // to run a command.
-type ExecTransport func(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error)
+type ExecTransport func(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error)
 
-func (e ExecTransport) Exec(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error) {
+func (e ExecTransport) Exec(ctx context.Context, streams stdio.Stdio, dir string, env map[string]string, args []string) (int, error) {
 	return e(ctx, streams, dir, env, args)
 }
 
@@ -176,7 +177,7 @@ func (e ExecTransport) Environ(ctx context.Context) ([]string, error) {
 		probeCtx, cancel := probing(ctx)
 
 		var code int
-		code, err = e(probeCtx, Streams{Stdout: &out, Stderr: io.Discard}, probeDir, nil,
+		code, err = e(probeCtx, stdio.Stdio{Stdout: &out, Stderr: io.Discard}, probeDir, nil,
 			[]string{"sh", "-c", environProbe})
 		cancel()
 
@@ -227,7 +228,7 @@ func (e ExecTransport) openRead(ctx context.Context, p string, stderr io.Writer)
 	ctx, cancel := context.WithCancel(ctx)
 	out := &firstByte{w: pw, seen: make(chan error, 1)}
 	go func() {
-		err := e.redirect(ctx, "open", p, readScript, Streams{Stdout: out})
+		err := e.redirect(ctx, "open", p, readScript, stdio.Stdio{Stdout: out})
 		_ = pw.Close()
 		cancel()
 		if !out.announce(err) && err != nil && !out.gone.Load() {
@@ -280,7 +281,7 @@ func (e ExecTransport) openWrite(ctx context.Context, p string, appending bool, 
 	ack := &ackWriter{seen: make(chan error, 1)}
 	w := &remoteWriter{w: pw, stderr: stderr, log: log.G(ctx), done: make(chan error, 1)}
 	go func() {
-		err := e.redirect(ctx, "write", p, snippet, Streams{Stdin: pr, Stdout: ack})
+		err := e.redirect(ctx, "write", p, snippet, stdio.Stdio{Stdin: pr, Stdout: ack})
 		_ = pr.CloseWithError(err)
 		// A helper that ended without a word never opened the file.
 		ack.announce(cmp.Or(err, error(fs.ErrInvalid)))
@@ -337,7 +338,7 @@ func (a *ackWriter) announce(err error) {
 
 // redirect runs a helper that streams a file, and reports any errors that may
 // occur
-func (e ExecTransport) redirect(ctx context.Context, op, p, snippet string, streams Streams) error {
+func (e ExecTransport) redirect(ctx context.Context, op, p, snippet string, streams stdio.Stdio) error {
 	var errOut bytes.Buffer
 	streams.Stderr = &errOut
 
@@ -372,7 +373,7 @@ func redirectError(errOut *bytes.Buffer) error {
 func (e ExecTransport) script(ctx context.Context, snippet string, args ...string) (string, error) {
 	var out, errOut bytes.Buffer
 
-	code, err := e(ctx, Streams{Stdout: &out, Stderr: &errOut}, probeDir, nil,
+	code, err := e(ctx, stdio.Stdio{Stdout: &out, Stderr: &errOut}, probeDir, nil,
 		append([]string{"sh", "-c", snippet, "sh"}, args...))
 	switch {
 	case err != nil:
