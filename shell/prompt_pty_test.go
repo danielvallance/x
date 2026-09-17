@@ -87,6 +87,9 @@ type terminal struct {
 	last      time.Time // when the session last wrote anything
 	mark      int       // how much of buf there was when the test last typed
 	forgotten int       // how much of buf the test has chosen not to see
+
+	queries  int // cursor positions readline has asked for, and been told
+	queryEnd int // where in buf the last of those questions ended
 }
 
 // settled is how long the session has to stay quiet, once a prompt is up,
@@ -146,8 +149,16 @@ func (term *terminal) ready() {
 	term.t.Helper()
 
 	require.Eventuallyf(term.t, func() bool {
-		return term.promptedSince() && term.quiet()
+		return term.measured() && term.promptedSince() && term.quiet()
 	}, 10*time.Second, 20*time.Millisecond, "the prompt never settled in:\n%q", term.seen())
+}
+
+// measured is whether readline has asked where the cursor is, been told, and
+// drawn since, as a key typed before the answer is taken is lost
+func (term *terminal) measured() bool {
+	term.mu.Lock()
+	defer term.mu.Unlock()
+	return term.queries > 0 && term.buf.Len() > term.queryEnd
 }
 
 // promptedSince is whether the screen ends in a prompt drawn after the test
@@ -197,11 +208,19 @@ func (term *terminal) answer(out string) string {
 	for query, reply := range map[string]string{
 		"\x1b]11;?": "\x1b]11;rgb:0000/0000/0000\a",
 		"\x1b[c":    "\x1b[?1;2c",
+		"\x1b[6n":   "\x1b[1;1R",
 	} {
 		for {
 			at := strings.Index(out, query)
 			if at < 0 {
 				break
+			}
+			if query == "\x1b[6n" {
+				// What follows the query in out is the tail of buf
+				term.mu.Lock()
+				term.queries++
+				term.queryEnd = term.buf.Len() - (len(out) - at - len(query))
+				term.mu.Unlock()
 			}
 			_, _ = term.ptmx.WriteString(reply)
 			out = out[:at] + out[at+len(query):]
