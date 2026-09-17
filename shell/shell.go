@@ -32,6 +32,7 @@ import (
 
 	xio "unikraft.com/x/io"
 	"unikraft.com/x/log"
+	"unikraft.com/x/stdio"
 )
 
 const (
@@ -90,7 +91,7 @@ func (s *state) dir() string {
 	return s.runner.Dir
 }
 
-func Run(ctx context.Context, cfg Config, streams Streams) (int, error) {
+func Run(ctx context.Context, cfg Config, streams stdio.Stdio) (int, error) {
 	s, err := newState(ctx, cfg, streams)
 	if err != nil {
 		return 0, err
@@ -110,7 +111,7 @@ func Run(ctx context.Context, cfg Config, streams Streams) (int, error) {
 
 // newState initializes the streams it writes on, the instance's environment,
 // and the interpreter over both.
-func newState(ctx context.Context, cfg Config, streams Streams) (*state, error) {
+func newState(ctx context.Context, cfg Config, streams stdio.Stdio) (*state, error) {
 	if cfg.Transport == nil {
 		return nil, fmt.Errorf("no transport to the instance")
 	}
@@ -177,11 +178,11 @@ func (s *state) runSource(ctx context.Context, src io.Reader) (int, error) {
 	if err := unsupported(prog); err != nil {
 		return 0, err
 	}
-	return exitStatus(s.runner.Run(ctx, prog))
+	return interpStatus(s.runner.Run(ctx, prog))
 }
 
-// exitStatus separates a command's exit status from the interpreter failing.
-func exitStatus(err error) (int, error) {
+// interpStatus separates a command's exit status from the interpreter failing.
+func interpStatus(err error) (int, error) {
 	if status, ok := errors.AsType[interp.ExitStatus](err); ok {
 		return int(status), nil
 	}
@@ -356,7 +357,7 @@ func (s *state) runStmt(ctx context.Context, stmt *syntax.Stmt) (status int, int
 		}
 	})
 
-	status, err = exitStatus(s.runner.Run(stmtCtx, stmt))
+	status, err = interpStatus(s.runner.Run(stmtCtx, stmt))
 	stop()
 
 	if !hit.Load() {

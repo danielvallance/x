@@ -11,6 +11,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"unikraft.com/x/stdio"
 )
 
 func TestDetachPolicy(t *testing.T) {
@@ -49,7 +51,7 @@ func TestDetachPolicy(t *testing.T) {
 			Dir:       "/",
 			Command:   "once",
 			Transport: ExecTransport(transport.Exec),
-		}, Streams{Stdin: strings.NewReader(""), Stdout: &captured{}, Stderr: &captured{}})
+		}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &captured{}, Stderr: &captured{}})
 		require.NoError(t, err)
 
 		assert.False(t, transport.lastDetached(t))

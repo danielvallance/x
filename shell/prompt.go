@@ -42,8 +42,6 @@ func newPrompt(cfg promptConfig) *prompt {
 	// Bytes above 0x7f are typed accents, not meta keys.
 	_ = rl.Config.Set("convert-meta", false)
 	_ = rl.Config.Set("output-meta", true)
-	// The prompt starts at column 0, which is what readline assumes without asking.
-	_ = rl.Config.Set("cursor-position-probe", false)
 	// The session prints its own ^C.
 	_ = rl.Config.Set("echo-control-characters", false)
 

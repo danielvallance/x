@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	xio "unikraft.com/x/io"
+	"unikraft.com/x/stdio"
 )
 
 // What goes wrong between the shell and the instance: a transport that fails
@@ -126,7 +127,7 @@ func TestTheTerminalShowsThroughTheConsole(t *testing.T) {
 		Dir:       newFixture(t),
 		Command:   `[ -t 1 ] && echo tty || echo pipe`,
 		Transport: local(),
-	}, Streams{Stdin: strings.NewReader(""), Stdout: tty, Stderr: tty})
+	}, stdio.Stdio{Stdin: strings.NewReader(""), Stdout: tty, Stderr: tty})
 	require.NoError(t, err)
 
 	select {
@@ -140,16 +141,15 @@ func TestTheTerminalShowsThroughTheConsole(t *testing.T) {
 // helperTransport runs everything here, except the helper whose script contains
 // marker: that one is answered by answer.
 type helperTransport struct {
-	localTransport
 	marker string
-	answer func(ctx context.Context, streams Streams) (int, error)
+	answer func(ctx context.Context, streams stdio.Stdio) (int, error)
 }
 
-func (t helperTransport) Exec(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error) {
-	if len(args) > 2 && args[0] == "sh" && strings.Contains(args[2], t.marker) {
-		return t.answer(ctx, streams)
+func (t helperTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if len(cmd.Args) > 2 && cmd.Args[0] == "sh" && strings.Contains(cmd.Args[2], t.marker) {
+		return t.answer(ctx, cmd.Streams)
 	}
-	return t.localTransport.Exec(ctx, streams, dir, env, args)
+	return local().Exec(ctx, cmd)
 }
 
 // crlf turns every newline written through it into CRLF, as a pty would.
@@ -164,14 +164,18 @@ func TestAWriteAckMayEndInCRLF(t *testing.T) {
 	root := newFixture(t)
 	out := filepath.Join(root, "out.txt")
 
-	transport := helperTransport{marker: "3>", answer: func(ctx context.Context, streams Streams) (int, error) {
+	transport := helperTransport{marker: "3>", answer: func(ctx context.Context, streams stdio.Stdio) (int, error) {
 		streams.Stdout = crlf{streams.Stdout}
-		return local().Exec(ctx, streams, root, nil, []string{"sh", "-c", writeScript, "sh", out})
+		return local().Exec(ctx, Command{
+			Args:    []string{"sh", "-c", writeScript, "sh", out},
+			Dir:     root,
+			Streams: streams,
+		})
 	}}
 
 	var buf captured
 	_, err := Run(t.Context(), Config{Instance: "fake", Dir: root, Command: "echo written > " + out, Transport: ExecTransport(transport.Exec)},
-		Streams{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
+		stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
 	require.NoError(t, err)
 
 	data, err := os.ReadFile(out)
@@ -181,7 +185,7 @@ func TestAWriteAckMayEndInCRLF(t *testing.T) {
 }
 
 func TestAWriteHelperThatBabblesFailsPromptly(t *testing.T) {
-	helper := helperTransport{marker: "3>", answer: func(_ context.Context, streams Streams) (int, error) {
+	helper := helperTransport{marker: "3>", answer: func(_ context.Context, streams stdio.Stdio) (int, error) {
 		fmt.Fprintln(streams.Stdout, "Warning: this instance is about to be retired")
 		fmt.Fprintln(streams.Stdout, "and more where that came from")
 		fmt.Fprintln(streams.Stderr, "sh: banner")
@@ -225,7 +229,7 @@ func TestAWriteThatNeverOpensIsInvalid(t *testing.T) {
 func TestAWriteThatFailsAfterTheAckIsReported(t *testing.T) {
 	root := newFixture(t)
 
-	transport := helperTransport{marker: "3>", answer: func(_ context.Context, streams Streams) (int, error) {
+	transport := helperTransport{marker: "3>", answer: func(_ context.Context, streams stdio.Stdio) (int, error) {
 		fmt.Fprintln(streams.Stdout, "ok")
 		_, _ = io.Copy(io.Discard, streams.Stdin)
 		fmt.Fprintln(streams.Stderr, "sh: 1: cannot write: No space left on device")
@@ -234,7 +238,7 @@ func TestAWriteThatFailsAfterTheAckIsReported(t *testing.T) {
 
 	var buf captured
 	_, err := Run(t.Context(), Config{Instance: "fake", Dir: root, Command: "echo data > /var/log/full; echo status=$?", Transport: ExecTransport(transport.Exec)},
-		Streams{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
+		stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
 	require.NoError(t, err)
 
 	assert.Contains(t, buf.String(), "No space left on device", "the only word of a redirection that died writing")
@@ -243,7 +247,7 @@ func TestAWriteThatFailsAfterTheAckIsReported(t *testing.T) {
 func TestAReadThatFailsMidStreamIsReported(t *testing.T) {
 	root := newFixture(t)
 
-	transport := helperTransport{marker: "cat --", answer: func(_ context.Context, streams Streams) (int, error) {
+	transport := helperTransport{marker: "cat --", answer: func(_ context.Context, streams stdio.Stdio) (int, error) {
 		fmt.Fprintln(streams.Stdout, "partial")
 		fmt.Fprintln(streams.Stderr, "cat: read error: Input/output error")
 		return 1, nil
@@ -251,7 +255,7 @@ func TestAReadThatFailsMidStreamIsReported(t *testing.T) {
 
 	var buf captured
 	_, err := Run(t.Context(), Config{Instance: "fake", Dir: root, Command: "cat < /var/log/app.log", Transport: ExecTransport(transport.Exec)},
-		Streams{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
+		stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
 	require.NoError(t, err)
 
 	assert.Contains(t, buf.String(), "partial\n", "what did arrive is not held back")
@@ -271,10 +275,10 @@ func TestAFailingBuiltinReportsItsError(t *testing.T) {
 	root := newFixture(t)
 
 	builtins := map[string]Builtin{
-		"fail": BuiltinFunc(func(_ context.Context, _ Streams, _ []string) (int, error) {
+		"fail": BuiltinFunc(func(_ context.Context, _ stdio.Stdio, _ []string) (int, error) {
 			return 0, errors.New("could not fail properly")
 		}),
-		"failcode": BuiltinFunc(func(_ context.Context, _ Streams, _ []string) (int, error) {
+		"failcode": BuiltinFunc(func(_ context.Context, _ stdio.Stdio, _ []string) (int, error) {
 			return 3, errors.New("failed with a status of its own")
 		}),
 	}
@@ -290,7 +294,7 @@ func TestAFailingBuiltinReportsItsError(t *testing.T) {
 		t.Run(tt.line, func(t *testing.T) {
 			var buf captured
 			code, err := Run(t.Context(), Config{Instance: "fake", Dir: root, Command: tt.line, Transport: local(), Builtins: builtins},
-				Streams{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
+				stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.code, code)
@@ -301,13 +305,13 @@ func TestAFailingBuiltinReportsItsError(t *testing.T) {
 
 // droppingTransport reaches the instance for the helpers but loses the
 // connection under every command.
-type droppingTransport struct{ localTransport }
+type droppingTransport struct{}
 
-func (t droppingTransport) Exec(ctx context.Context, streams Streams, dir string, env map[string]string, args []string) (int, error) {
-	if args[0] != "sh" {
+func (t droppingTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if cmd.Args[0] != "sh" {
 		return 0, errors.New("connection reset by peer")
 	}
-	return t.localTransport.Exec(ctx, streams, dir, env, args)
+	return local().Exec(ctx, cmd)
 }
 
 func TestACommandTheTransportLosesIsAFailedCommand(t *testing.T) {
@@ -315,7 +319,7 @@ func TestACommandTheTransportLosesIsAFailedCommand(t *testing.T) {
 
 	var buf captured
 	_, err := Run(t.Context(), Config{Instance: "fake", Dir: root, Command: "uptime; echo status=$?", Transport: ExecTransport(droppingTransport{}.Exec)},
-		Streams{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
+		stdio.Stdio{Stdin: strings.NewReader(""), Stdout: &buf, Stderr: &buf})
 	require.NoError(t, err, "the session goes on")
 
 	assert.Regexp(t, `^connection reset by peer\nstatus=1\n$`, buf.String())
