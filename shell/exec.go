@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"slices"
 	"strings"
 
 	"mvdan.cc/sh/v3/expand"
@@ -17,7 +18,7 @@ import (
 )
 
 const (
-	// BuiltinMarker is what marks a word as a builtin: ":help", not "help".
+	// BuiltinMarker is what marks a word as a builtin: ":start", not "start".
 	BuiltinMarker = ":"
 
 	// helpBuiltin is the one builtin the session knows the name of, to point at
@@ -32,9 +33,14 @@ const (
 	// StatusInterrupted is what a command killed by a signal reports.
 	StatusInterrupted = 130
 
+	// statusNotRun is what a line the shell refuses to run reports.
+	statusNotRun = 2
+
 	// maxSignal is the highest signal number an exit code can encode.
 	maxSignal = 64
 )
+
+var sessionBuiltinNames = []string{"history"}
 
 // route sends a ":"-marked word to a builtin, which runs locally, and every other
 // command to the instance.
@@ -76,9 +82,18 @@ func (s *state) runBuiltin(ctx context.Context, args []string) error {
 	streams := Streams{Stdin: hc.Stdin, Stdout: hc.Stdout, Stderr: hc.Stderr}
 
 	args = append([]string{strings.TrimPrefix(args[0], BuiltinMarker)}, args[1:]...)
+	if slices.Contains(sessionBuiltinNames, args[0]) {
+		return s.runSessionBuiltin(streams, args)
+	}
+
 	builtin, ok := s.cfg.Builtins[args[0]]
+	if !ok && args[0] == helpBuiltin {
+		// Nobody else lists builtins, so the session lists its own.
+		s.printSessionBuiltins(streams.Stdout)
+		return nil
+	}
 	if !ok {
-		fmt.Fprintln(hc.Stderr, errorStyle.Render(s.unknownBuiltin(args[0])))
+		fmt.Fprintln(hc.Stderr, errorStyle.Render(unknownBuiltin(args[0])))
 		return interp.ExitStatus(statusBuiltinNotFound)
 	}
 
@@ -89,15 +104,33 @@ func (s *state) runBuiltin(ctx context.Context, args []string) error {
 			code = 1
 		}
 	}
+	if args[0] == helpBuiltin && err == nil {
+		s.printSessionBuiltins(streams.Stdout)
+	}
 	return codeToExitStatus(code)
 }
 
-func (s *state) unknownBuiltin(name string) string {
-	said := fmt.Sprintf("unknown builtin %q", name)
-	if _, ok := s.cfg.Builtins[helpBuiltin]; ok {
-		said += "; try " + BuiltinMarker + helpBuiltin
+func unknownBuiltin(name string) string {
+	return fmt.Sprintf("unknown builtin %q; try %s%s", name, BuiltinMarker, helpBuiltin)
+}
+
+func (s *state) runSessionBuiltin(streams Streams, args []string) error {
+	switch args[0] {
+	case "history":
+		if s.history == nil {
+			fmt.Fprintln(streams.Stderr, errorStyle.Render("history: only at the prompt"))
+			return interp.ExitStatus(1)
+		}
+		for i, line := range s.history.recalled() {
+			fmt.Fprintf(streams.Stdout, "%5d  %s\n", i+1, line)
+		}
 	}
-	return said
+	return nil
+}
+
+func (s *state) printSessionBuiltins(out io.Writer) {
+	fmt.Fprintf(out, "  %-34s %s\n", BuiltinMarker+"history", "List what this session has run.")
+	fmt.Fprintln(out, "\nEverything else runs on the instance.")
 }
 
 func resolve(dir, p string) string {
