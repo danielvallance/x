@@ -7,14 +7,18 @@ package shell
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1066,4 +1070,600 @@ func TestAFailingProbeSaysWhy(t *testing.T) {
 	_, err := s.Stat(t.Context(), "/", "/etc", true)
 	require.ErrorContains(t, err, "out of memory")
 	assert.NotErrorIs(t, err, fs.ErrNotExist, "a probe that complained did not find the path missing")
+}
+
+// envTransport answers the environment probe and keeps what the last command
+// was given to run with.
+type envTransport struct {
+	environ string
+
+	mu  sync.Mutex
+	env []string
+}
+
+func (t *envTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	if len(cmd.Args) > 2 && cmd.Args[2] == environProbe {
+		fmt.Fprint(cmd.Streams.Stdout, t.environ)
+		return 0, nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.env = slices.Clone(cmd.Env)
+	return 0, nil
+}
+
+func (t *envTransport) lastEnv() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.env)
+}
+
+func TestEvalIsVettedLikeALine(t *testing.T) {
+	transport := newHaltingTransport()
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "eval 'allowed'")
+	require.NoError(t, err)
+	assert.Contains(t, transport.commands(), "allowed", "a line the vet allows still runs")
+
+	_, err = s.RunLine(t.Context(), "eval 'smuggled &'")
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "eval: ")
+	assert.Contains(t, out.String(), "& is not supported")
+	assert.NotContains(t, transport.commands(), "smuggled",
+		"what the vet refuses on a line it refuses through eval too")
+
+	for _, line := range []string{"command eval 'smuggled &'", "command -- eval 'smuggled &'", "builtin eval 'smuggled &'"} {
+		_, err = s.RunLine(t.Context(), line)
+		require.NoError(t, err)
+		assert.NotContains(t, transport.commands(), "smuggled",
+			"%s reaches the interpreter's own eval, so the vet looks past the words in front", line)
+	}
+
+	asking, _, said := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+	_, err = asking.RunLine(t.Context(), "command -v eval")
+	require.NoError(t, err)
+	assert.NotContains(t, said.String(), "eval: ", "asking where eval is runs nothing to vet")
+}
+
+func TestEvalCannotSmuggleProcessSubstitution(t *testing.T) {
+	transport := newHaltingTransport()
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "eval 'true <(:)'")
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "process substitution is not supported",
+		"the pipe would be made on this machine, in a directory the instance named")
+}
+
+func TestEvalSurvivesWhatItCannotParse(t *testing.T) {
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+
+	_, err := s.RunLine(t.Context(), "eval 'for'")
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "eval: ")
+	assert.False(t, s.Exited(), "a refusal is not the end of the session")
+}
+
+func TestSourceIsRefused(t *testing.T) {
+	for _, line := range []string{"source /etc/profile", ". /etc/profile", "builtin source /etc/profile"} {
+		t.Run(line, func(t *testing.T) {
+			transport := newHaltingTransport()
+			s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+			_, err := s.RunLine(t.Context(), line)
+
+			require.NoError(t, err)
+			assert.Contains(t, out.String(), "is not supported, the file would be read here")
+			for _, ran := range transport.commands() {
+				assert.NotContains(t, ran, readScript, "the file was never even fetched")
+			}
+		})
+	}
+}
+
+func TestATrapActionIsVetted(t *testing.T) {
+	t.Run("refuses-what-the-vet-refuses", func(t *testing.T) {
+		transport := newHaltingTransport()
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap 'smuggled &' EXIT")
+		require.NoError(t, err)
+		require.NoError(t, s.Close(t.Context()))
+
+		assert.Contains(t, out.String(), "trap: ")
+		assert.NotContains(t, transport.commands(), "smuggled",
+			"the action never became the session's to run on the way out")
+	})
+
+	t.Run("keeps-an-action-it-allows", func(t *testing.T) {
+		transport := newHaltingTransport()
+		s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap 'on-the-way-out' EXIT")
+		require.NoError(t, err)
+		require.NoError(t, s.Close(t.Context()))
+
+		assert.Contains(t, transport.commands(), "on-the-way-out", "the trap still fires on the way out")
+	})
+
+	t.Run("refuses-an-action-behind-the-end-of-options", func(t *testing.T) {
+		transport := newHaltingTransport()
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap -- 'smuggled &' EXIT")
+		require.NoError(t, err)
+		require.NoError(t, s.Close(t.Context()))
+
+		assert.Contains(t, out.String(), "trap: ")
+		assert.NotContains(t, transport.commands(), "smuggled",
+			"the interpreter reads past --, and so does the vet")
+	})
+
+	t.Run("leaves-a-trap-that-only-names-a-signal", func(t *testing.T) {
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+
+		for _, line := range []string{"trap", "trap EXIT", "trap -- EXIT"} {
+			_, err := s.RunLine(t.Context(), line)
+			require.NoError(t, err)
+		}
+
+		assert.NotContains(t, out.String(), "trap: ", "no action is installed, so there is none to vet")
+	})
+
+	t.Run("leaves-a-trap-that-clears-one", func(t *testing.T) {
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap - EXIT")
+
+		require.NoError(t, err)
+		assert.NotContains(t, out.String(), "trap: ", "clearing a trap parses to a command like any other")
+	})
+}
+
+func TestTheInterpreterKeepsItsOwnTempDir(t *testing.T) {
+	kept, tmpdir, exported := withoutTmpdir([]string{"HOME=/", "TMPDIR=/instance/tmp", "PATH=/bin"})
+
+	assert.Equal(t, []string{"HOME=/", "PATH=/bin"}, kept,
+		"what the interpreter runs on names no directory of the instance's choosing")
+	assert.Equal(t, "/instance/tmp", tmpdir)
+	assert.True(t, exported)
+
+	_, tmpdir, exported = withoutTmpdir([]string{"TMPDIR="})
+	assert.Empty(t, tmpdir)
+	assert.True(t, exported, "an empty one is still one the instance exported")
+
+	_, _, exported = withoutTmpdir([]string{"HOME=/"})
+	assert.False(t, exported)
+}
+
+func TestACommandStillHasTheInstancesTempDir(t *testing.T) {
+	transport := &envTransport{environ: "HOME=/\x00PATH=/bin\x00TMPDIR=/instance/tmp\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "somewhere")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.lastEnv(), "TMPDIR=/instance/tmp",
+		"the instance's own commands keep the directory the instance exported")
+}
+
+func TestACommandKeepsAnEmptyTempDir(t *testing.T) {
+	transport := &envTransport{environ: "HOME=/\x00PATH=/bin\x00TMPDIR=\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "somewhere")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.lastEnv(), "TMPDIR=",
+		"the instance exported it empty, so a command still sees it empty and not unset")
+}
+
+// floodTransport answers one command with output that never ends, and keeps
+// the context it was handed so a test can see it cut short.
+type floodTransport struct {
+	mu      sync.Mutex
+	stopped bool
+}
+
+func (t *floodTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if cmd.Args[0] != "flood" {
+		return 0, nil
+	}
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	for {
+		_, err := cmd.Streams.Stdout.Write(chunk)
+		if err == nil && ctx.Err() == nil {
+			continue
+		}
+		t.mu.Lock()
+		t.stopped = ctx.Err() != nil
+		t.mu.Unlock()
+		return StatusInterrupted, nil
+	}
+}
+
+func (t *floodTransport) cutShort() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopped
+}
+
+func TestACaptureIsCapped(t *testing.T) {
+	transport := &floodTransport{}
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	status, err := s.RunLine(t.Context(), "captured=$(flood)")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, status, "the command substitution failed rather than filling this machine")
+	assert.Contains(t, out.String(), "command substitution kept more than 8 MiB")
+	assert.True(t, transport.cutShort(), "the instance was told to stop, not left to write on")
+}
+
+func TestASmallCaptureIsUntouched(t *testing.T) {
+	transport := scriptTransport("hi\n")
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	status, err := s.RunLine(t.Context(), "captured=$(say-hi); printf %s \"$captured\"")
+
+	require.NoError(t, err)
+	assert.Zero(t, status)
+	assert.Contains(t, out.String(), "hi", "what fits is kept byte for byte")
+}
+
+func TestAStreamIsNotCapped(t *testing.T) {
+	var written int64
+	transport := ExecTransport(func(ctx context.Context, cmd Command) (int, error) {
+		if cmd.Args[0] != "flood" {
+			return 0, nil
+		}
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for range 200 {
+			n, err := cmd.Streams.Stdout.Write(chunk)
+			written += int64(n)
+			if err != nil {
+				return 1, nil
+			}
+		}
+		return 0, nil
+	})
+	s, _, _ := newDrivenSession(t, Config{Transport: transport})
+
+	status, err := s.RunLine(t.Context(), "flood > /dev/null")
+
+	require.NoError(t, err)
+	assert.Zero(t, status)
+	assert.Equal(t, int64(200*(64<<10)), written,
+		"a stream answers for its own size, so the cap left it alone")
+}
+
+func TestAProbeIsCapped(t *testing.T) {
+	flood := ExecTransport(func(_ context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("d name\x00"), 1<<10)
+		for range 1 << 10 {
+			if _, err := cmd.Streams.Stdout.Write(chunk); err != nil {
+				return 1, nil
+			}
+		}
+		return 0, nil
+	})
+
+	_, err := flood.ReadDir(t.Context(), "/", "big")
+
+	require.ErrorContains(t, err, "more than 4 MiB",
+		"a directory listing is not the instance's to make this machine hold")
+}
+
+func TestABuiltinsCaptureIsCapped(t *testing.T) {
+	flooding := map[string]Builtin{
+		"flood": BuiltinFunc(func(ctx context.Context, streams stdio.Stdio, _ []string) (int, error) {
+			chunk := bytes.Repeat([]byte("x"), 64<<10)
+			for ctx.Err() == nil {
+				if _, err := streams.Stdout.Write(chunk); err != nil {
+					return 1, nil
+				}
+			}
+			return 0, nil
+		}),
+	}
+	s, _, out := newDrivenSession(t, Config{
+		Transport: ExecTransport(scriptTransport("").Exec),
+		Builtins:  flooding,
+	})
+
+	status, err := s.RunLine(t.Context(), "captured=$(:flood)")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, status, "a builtin fills a command substitution as readily as the instance")
+	assert.Contains(t, out.String(), "command substitution kept more than 8 MiB")
+}
+
+func TestAProbesComplaintIsCapped(t *testing.T) {
+	flood := ExecTransport(func(_ context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for range 1 << 7 {
+			if _, err := cmd.Streams.Stderr.Write(chunk); err != nil {
+				return 1, nil
+			}
+		}
+		return 1, nil
+	})
+
+	_, err := flood.Stat(t.Context(), "/", "somewhere", true)
+
+	require.ErrorContains(t, err, "more than 4 MiB",
+		"what the helper complains with is held here too")
+}
+
+func TestAFloodingProbeIsCutShort(t *testing.T) {
+	var wrote int64
+	flood := ExecTransport(func(ctx context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("d name\x00"), 1<<10)
+		for ctx.Err() == nil {
+			n, err := cmd.Streams.Stdout.Write(chunk)
+			wrote += int64(n)
+			if err != nil {
+				return 1, nil
+			}
+		}
+		return 1, nil
+	})
+
+	_, err := flood.ReadDir(t.Context(), "/", "big")
+
+	require.ErrorContains(t, err, "more than 4 MiB")
+	assert.Less(t, wrote, int64(2*maxProbeOutput),
+		"the instance was told to stop rather than left to send the rest")
+}
+
+func TestTheEnvironmentProbeIsCapped(t *testing.T) {
+	flood := ExecTransport(func(ctx context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("NAME=value\x00"), 1<<10)
+		for ctx.Err() == nil {
+			if _, err := cmd.Streams.Stdout.Write(chunk); err != nil {
+				return 1, nil
+			}
+		}
+		return 1, nil
+	})
+
+	_, err := flood.Environ(t.Context())
+
+	require.ErrorContains(t, err, "more than 4 MiB",
+		"an instance does not get to fill this machine while the session is opening")
+}
+
+// nodeError is what a transport reaching a node over HTTP fails with.
+func nodeError() error {
+	return fmt.Errorf("failed to start command: %w", &url.Error{
+		Op:  "Post",
+		URL: "https://node-7.fra0.example/v1/instances/abc/plugins/sandbox/commands?token=s3cret",
+		Err: &net.OpError{
+			Op:   "dial",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 443},
+			Err:  errors.New("connect: connection refused"),
+		},
+	})
+}
+
+// failingTransport opens a session and then fails every command it is asked to run.
+func failingTransport(err error) ExecTransport {
+	return func(_ context.Context, cmd Command) (int, error) {
+		if len(cmd.Args) > 2 && cmd.Args[2] == environProbe {
+			return 0, nil
+		}
+		return 0, err
+	}
+}
+
+func TestATransportErrorKeepsTheNodeToItself(t *testing.T) {
+	s, _, out := newDrivenSession(t, Config{Transport: failingTransport(nodeError())})
+
+	status, err := s.RunLine(t.Context(), "somewhere")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, status)
+	said := out.String()
+	assert.NotContains(t, said, "node-7.fra0.example", "the node the transport reached is not the user's business")
+	assert.NotContains(t, said, "s3cret")
+	assert.NotContains(t, said, "10.0.0.5")
+	assert.Contains(t, said, "failed to start command", "what the transport wrote for a person survives")
+	assert.Contains(t, said, "connection refused", "and so does why it failed")
+}
+
+func TestAnErrorKeepsWhatTheTransportSaid(t *testing.T) {
+	plain := errors.New("the instance has no sh")
+
+	assert.Same(t, plain, sanitised(plain), "an error naming no address is the one it was given")
+	assert.NoError(t, sanitised(nil))
+}
+
+func TestASanitisedErrorIsStillTheOneItWasMadeFrom(t *testing.T) {
+	err := sanitised(fmt.Errorf("reading: %w", &url.Error{
+		Op: "Get", URL: "https://node-7.example/logs", Err: fs.ErrNotExist,
+	}))
+
+	require.ErrorIs(t, err, fs.ErrNotExist, "what the shell tests errors for still answers")
+	assert.NotContains(t, err.Error(), "node-7.example")
+	assert.Contains(t, err.Error(), "reading: Get: ")
+}
+
+func TestAProbeErrorKeepsTheNodeToItself(t *testing.T) {
+	_, err := failingTransport(nodeError()).Stat(t.Context(), "/", "somewhere", true)
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "node-7.fra0.example",
+		"a file question fails the same way a command does")
+}
+
+// askedTransport answers the instance's file questions and keeps what it was
+// asked, so a test can count the round trips a line costs.
+type askedTransport struct {
+	environ string
+	kind    string
+
+	mu    sync.Mutex
+	asked []string
+}
+
+func (t *askedTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	snippet := ""
+	if len(cmd.Args) > 2 {
+		snippet = cmd.Args[2]
+	}
+
+	switch snippet {
+	case environProbe:
+		fmt.Fprint(cmd.Streams.Stdout, cmp.Or(t.environ, "EUID=0\x00"))
+		return 0, nil
+	case statScript:
+		t.record("stat " + cmd.Args[4])
+		fmt.Fprintln(cmd.Streams.Stdout, cmp.Or(t.kind, "d")+" 0 0 -")
+	case accessScript:
+		t.record("access " + cmd.Args[4])
+		fmt.Fprintln(cmd.Streams.Stdout, "ok")
+	default:
+		t.record("run " + cmd.Args[0])
+	}
+	return 0, nil
+}
+
+func (t *askedTransport) record(what string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.asked = append(t.asked, what)
+}
+
+func (t *askedTransport) questions() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.asked)
+}
+
+func TestCdAsksTheInstanceOnce(t *testing.T) {
+	transport := &askedTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+
+	require.NoError(t, err)
+	assert.Equal(t, "/var/log", s.Dir())
+	assert.Equal(t, []string{"stat /var/log"}, transport.questions(),
+		"a stat already says root may enter the directory it describes")
+}
+
+func TestTheSamePathIsAskedAfterOnce(t *testing.T) {
+	transport := &askedTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+	require.NoError(t, err)
+	_, err = s.RunLine(t.Context(), "cd /var/log")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"stat /var/log"}, transport.questions(),
+		"nothing ran on the instance in between, so the answer still holds")
+}
+
+func TestWhatRanOnTheInstanceIsNotRemembered(t *testing.T) {
+	transport := &askedTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log; something; cd /var/log")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"stat /var/log", "run something", "stat /var/log"},
+		transport.questions(), "a command may have moved what was there")
+}
+
+func TestANonRootSessionStillAsksAboutAccess(t *testing.T) {
+	transport := &askedTransport{environ: "EUID=1000\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"stat /var/log", "access /var/log"}, transport.questions(),
+		"only root enters a directory whatever its mode says")
+}
+
+func TestOnlyADirectoryIsAnsweredFromAStat(t *testing.T) {
+	transport := &askedTransport{kind: "f"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "[ -x /bin/tool ]")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.questions(), "access /bin/tool",
+		"whether a file runs is the instance's to say, the stat not carrying its mode")
+}
+
+func TestTheSessionCannotTalkItselfIntoBeingRoot(t *testing.T) {
+	transport := &askedTransport{environ: "EUID=1000\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "export EUID=0; cd /var/log")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.questions(), "access /var/log",
+		"who the session is was settled by the instance, not by what it later assigned")
+}
+
+func TestTheCommandLineCannotEitherClaimRoot(t *testing.T) {
+	transport := &askedTransport{environ: "EUID=1000\x00"}
+	s, _, _ := newDrivenSession(t, Config{
+		Transport: ExecTransport(transport.Exec),
+		Env:       map[string]string{"EUID": "0"},
+	})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.questions(), "access /var/log",
+		"an environment the caller passed in is not the instance speaking")
+}
+
+func TestAStatThatFailedIsAskedAgain(t *testing.T) {
+	transport := &refusingStatTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "[ -d /gone ]; [ -d /gone ]")
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, transport.stats,
+		"a question the instance could not answer is not an answer to keep")
+}
+
+// refusingStatTransport opens a session and then fails every stat it is asked.
+type refusingStatTransport struct{ stats int }
+
+func (t *refusingStatTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	if len(cmd.Args) > 2 && cmd.Args[2] == statScript {
+		t.stats++
+		return 0, errors.New("the instance is not answering")
+	}
+	return 0, nil
+}
+
+func TestAStatOvertakenByACommandIsNotKept(t *testing.T) {
+	s := &state{}
+	key := statKey{path: "/var/log", follow: true}
+
+	// What a pipeline does: one branch asks about a path while the other runs
+	// something on the instance and finishes first.
+	asOf := s.statsAsOf()
+	s.forgetStats()
+	s.rememberStat(key, remoteFileInfo{name: "log", kind: "d"}, asOf)
+
+	_, asked := s.recalledStat(key)
+	assert.False(t, asked, "the answer described the instance as it was before that command")
+
+	asOf = s.statsAsOf()
+	s.rememberStat(key, remoteFileInfo{name: "log", kind: "d"}, asOf)
+	_, asked = s.recalledStat(key)
+	assert.True(t, asked, "nothing ran while this one was being asked")
 }

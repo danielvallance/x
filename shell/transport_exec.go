@@ -172,9 +172,8 @@ func (e ExecTransport) Open(ctx context.Context, dir, name string, flag int, std
 func (e ExecTransport) Environ(ctx context.Context) ([]string, error) {
 	var err error
 	for range instanceProbeAttempts {
-		var out bytes.Buffer
-
 		probeCtx, cancel := probing(ctx)
+		out := cappedBuffer{limit: maxProbeOutput, stop: cancel}
 
 		var code int
 		code, err = e(probeCtx, Command{
@@ -185,15 +184,17 @@ func (e ExecTransport) Environ(ctx context.Context) ([]string, error) {
 		cancel()
 
 		switch {
+		case out.full:
+			return nil, fmt.Errorf("the instance answered with more than %d MiB", maxProbeOutput>>20)
 		case err == nil && code == statusBuiltinNotFound:
 			return nil, ErrNoShell
 		case err == nil:
 			return environOf(out.String()), nil
 		case ctx.Err() != nil:
-			return nil, err
+			return nil, sanitised(err)
 		}
 	}
-	return nil, err
+	return nil, sanitised(err)
 }
 
 // environOf is the NUL-separated record the environ probe prints.
@@ -342,7 +343,7 @@ func (a *ackWriter) announce(err error) {
 // redirect runs a helper that streams a file, and reports any errors that may
 // occur
 func (e ExecTransport) redirect(ctx context.Context, op, p, snippet string, streams stdio.Stdio) error {
-	var errOut bytes.Buffer
+	errOut := cappedBuffer{limit: maxProbeOutput}
 	streams.Stderr = &errOut
 
 	code, err := e(ctx, Command{
@@ -352,20 +353,20 @@ func (e ExecTransport) redirect(ctx context.Context, op, p, snippet string, stre
 	})
 	switch {
 	case err != nil:
-		return &fs.PathError{Op: op, Path: p, Err: err}
+		return &fs.PathError{Op: op, Path: p, Err: sanitised(err)}
 	case ctx.Err() != nil:
 		return nil
 	case code < 0:
 		return &fs.PathError{Op: op, Path: p, Err: fmt.Errorf("the helper was signalled (%d)", -code)}
 	case code != 0:
-		return &fs.PathError{Op: op, Path: p, Err: redirectError(&errOut)}
+		return &fs.PathError{Op: op, Path: p, Err: redirectError(errOut.String())}
 	default:
 		return nil
 	}
 }
 
-func redirectError(errOut *bytes.Buffer) error {
-	said := strings.TrimSpace(errOut.String())
+func redirectError(errOut string) error {
+	said := strings.TrimSpace(errOut)
 	if _, detail, ok := strings.Cut(said, ": "); ok {
 		said = detail
 	}
@@ -375,9 +376,16 @@ func redirectError(errOut *bytes.Buffer) error {
 	return errors.New(said)
 }
 
+// maxProbeOutput is how much of a helper's output the shell will hold.
+const maxProbeOutput = 1 << 22
+
 // script runs a helper on the context it is given, and returns what it printed
 func (e ExecTransport) script(ctx context.Context, snippet string, args ...string) (string, error) {
-	var out, errOut bytes.Buffer
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	out := cappedBuffer{limit: maxProbeOutput, stop: cancel}
+	errOut := cappedBuffer{limit: maxProbeOutput, stop: cancel}
 
 	code, err := e(ctx, Command{
 		Args:    append([]string{"sh", "-c", snippet, "sh"}, args...),
@@ -385,8 +393,10 @@ func (e ExecTransport) script(ctx context.Context, snippet string, args ...strin
 		Streams: stdio.Stdio{Stdout: &out, Stderr: &errOut},
 	})
 	switch {
+	case out.full || errOut.full:
+		return "", fmt.Errorf("the instance answered with more than %d MiB", maxProbeOutput>>20)
 	case err != nil:
-		return "", err
+		return "", sanitised(err)
 	case code < 0:
 		return "", fmt.Errorf("the probe was signalled (%d)", -code)
 	case code != 0:
@@ -398,3 +408,30 @@ func (e ExecTransport) script(ctx context.Context, snippet string, args ...strin
 		return out.String(), nil
 	}
 }
+
+// cappedBuffer keeps what a helper printed, and no more than limit of it.
+type cappedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+	stop  context.CancelFunc
+	full  bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	room := c.limit - c.buf.Len()
+	if len(p) <= room {
+		return c.buf.Write(p)
+	}
+	if !c.full {
+		c.full = true
+		if c.stop != nil {
+			c.stop()
+		}
+	}
+	if room > 0 {
+		_, _ = c.buf.Write(p[:room])
+	}
+	return len(p), nil
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }

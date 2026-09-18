@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"os/signal"
@@ -85,6 +86,11 @@ type state struct {
 	history     *sessionHistory
 	interrupts  chan os.Signal
 	exiting     atomic.Bool
+	euid        string
+
+	statsMu  sync.Mutex
+	stats    map[statKey]fs.FileInfo
+	statsGen uint64
 }
 
 func (s *state) dir() string {
@@ -143,6 +149,7 @@ func newState(ctx context.Context, cfg Config, streams stdio.Stdio) (*state, err
 	if err != nil {
 		return nil, err
 	}
+	env, tmpdir, exported := withoutTmpdir(env)
 
 	in := streams.Stdin
 	if cfg.Input != nil {
@@ -166,8 +173,29 @@ func newState(ctx context.Context, cfg Config, streams stdio.Stdio) (*state, err
 
 	runner.Dir = cfg.Dir
 	runner.Reset()
+	if exported {
+		if quoted, err := syntax.Quote(tmpdir, syntax.LangPOSIX); err == nil {
+			_ = runner.Run(ctx, mustParse("export TMPDIR=" + quoted).Stmts[0])
+		}
+	}
 	s.runner = runner
 	return s, nil
+}
+
+// withoutTmpdir takes TMPDIR out of the environment the interpreter runs on,
+// and says whether the instance exported one at all: an empty one is still one.
+func withoutTmpdir(env []string) ([]string, string, bool) {
+	var tmpdir string
+	var exported bool
+	kept := make([]string, 0, len(env))
+	for _, record := range env {
+		if name, value, ok := strings.Cut(record, "="); ok && name == "TMPDIR" {
+			tmpdir, exported = value, true
+			continue
+		}
+		kept = append(kept, record)
+	}
+	return kept, tmpdir, exported
 }
 
 func (s *state) runSource(ctx context.Context, src io.Reader) (int, error) {
@@ -430,15 +458,83 @@ func (s *state) captureInterrupts() (stop func()) {
 	}
 }
 
-// call notes an exit, runs a session builtin typed bare, and keeps lookups remote.
+// call notes an exit, vets what the interpreter would parse again, runs a
+// session builtin typed bare, and keeps lookups remote.
 func (s *state) call(ctx context.Context, args []string) ([]string, error) {
 	if args[0] == "exit" {
 		s.exiting.Store(true)
+	}
+	if err := vetReparsed(reparsing(args)); err != nil {
+		return nil, err
 	}
 	if args[0] == helpBuiltin || slices.Contains(sessionBuiltinNames, args[0]) {
 		return append([]string{BuiltinMarker + args[0]}, args[1:]...), nil
 	}
 	return keepLookupsRemote(ctx, args)
+}
+
+func vetReparsed(args []string) error {
+	switch args[0] {
+	case "eval":
+		if err := vetSource(strings.Join(args[1:], " ")); err != nil {
+			return fmt.Errorf("eval: %w", err)
+		}
+	case "trap":
+		if action, installed := trapAction(args[1:]); installed {
+			if err := vetSource(action); err != nil {
+				return fmt.Errorf("trap: %w", err)
+			}
+		}
+	case "source", ".":
+		return fmt.Errorf("%s is not supported, the file would be read here and run unchecked", args[0])
+	}
+	return nil
+}
+
+// trapAction is what the interpreter would install, past the options it reads
+// first: one argument left names a signal to restore, and none lists the traps.
+func trapAction(args []string) (string, bool) {
+	for len(args) > 0 {
+		if args[0] == "--" {
+			args = args[1:]
+			break
+		}
+		if args[0] == "" || (args[0][0] != '-' && args[0][0] != '+') {
+			break
+		}
+		args = args[1:]
+	}
+	if len(args) < 2 {
+		return "", false
+	}
+	return args[0], true
+}
+
+func reparsing(args []string) []string {
+	for len(args) > 1 {
+		switch args[0] {
+		case "builtin", "command":
+			args = args[1:]
+			if args[0] == "--" && len(args) > 1 {
+				args = args[1:]
+			}
+		default:
+			return args
+		}
+		if strings.HasPrefix(args[0], "-") {
+			return args
+		}
+	}
+	return args
+}
+
+// vetSource is [unsupported] over text that has not been parsed yet
+func vetSource(src string) error {
+	prog, err := syntax.NewParser().Parse(strings.NewReader(src), "")
+	if err != nil {
+		return err
+	}
+	return unsupported(prog)
 }
 
 // remoteBuiltins are the builtins the interpreter knows the names of but does
@@ -510,6 +606,7 @@ func (s *state) environ(ctx context.Context) ([]string, error) {
 			vars[name] = value
 		}
 	}
+	s.euid = vars["EUID"]
 	maps.Copy(vars, s.cfg.Env)
 
 	for name, fallback := range environFallbacks {

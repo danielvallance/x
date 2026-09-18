@@ -7,11 +7,13 @@ package shell
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
@@ -40,6 +42,15 @@ const (
 
 	// maxSignal is the highest signal number an exit code can encode.
 	maxSignal = 64
+
+	// maxCapture is how much of a command substitution the shell will hold.
+	maxCapture = 1 << 23
+)
+
+var (
+	errCaptureFull = errors.New("the command substitution is full")
+
+	captureFull = fmt.Sprintf("command substitution kept more than %d MiB", maxCapture>>20)
 )
 
 var sessionBuiltinNames = []string{"history"}
@@ -48,6 +59,7 @@ var sessionBuiltinNames = []string{"history"}
 // command to the instance.
 func (s *state) route(_ interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
+		s.forgetStats()
 		if len(args[0]) > len(BuiltinMarker) && strings.HasPrefix(args[0], BuiltinMarker) {
 			return s.runBuiltin(ctx, args)
 		}
@@ -68,26 +80,83 @@ func (s *state) runRemote(ctx context.Context, args []string) error {
 	// context's watcher gets around to it.
 	defer reclaim()
 
+	out, capture := capturing(streams.Stdout, done)
+	streams.Stdout = out
+
 	code, err := s.cfg.Transport.Exec(ctx, Command{
 		Args:    args,
 		Dir:     hc.Dir,
 		Env:     envList(hc.Env),
 		Streams: streams,
 	})
-	if err != nil {
-		if ctx.Err() != nil {
-			return interp.ExitStatus(StatusInterrupted)
-		}
-		fmt.Fprintln(hc.Stderr, errorStyle.Render(err.Error()))
+	switch {
+	case capture.filled():
+		fmt.Fprintln(hc.Stderr, errorStyle.Render(captureFull))
+		return interp.ExitStatus(1)
+	case err != nil && ctx.Err() != nil:
+		return interp.ExitStatus(StatusInterrupted)
+	case err != nil:
+		fmt.Fprintln(hc.Stderr, errorStyle.Render(sanitised(err).Error()))
 		return interp.ExitStatus(1)
 	}
 	return codeToExitStatus(code)
 }
 
+// capturing is the interpreter keeping a command's output in memory, as it does
+// for $(...) and nowhere else: a pipe or a file answers for its own size.
+func capturing(w io.Writer, stop context.CancelFunc) (io.Writer, *cappedCapture) {
+	held, ok := w.(*strings.Builder)
+	if !ok {
+		return w, nil
+	}
+	capture := &cappedCapture{held: held, stop: stop}
+	return capture, capture
+}
+
+// cappedCapture holds a command substitution to [maxCapture], however many
+// commands write into it, and stops the one that filled it.
+type cappedCapture struct {
+	held *strings.Builder
+	stop context.CancelFunc
+	full atomic.Bool
+}
+
+func (c *cappedCapture) filled() bool { return c != nil && c.full.Load() }
+
+func (c *cappedCapture) Write(p []byte) (int, error) {
+	room := maxCapture - c.held.Len()
+	if len(p) <= room {
+		return c.held.Write(p)
+	}
+
+	c.full.Store(true)
+	c.stop()
+	if room <= 0 {
+		return 0, errCaptureFull
+	}
+	n, _ := c.held.Write(p[:room])
+	return n, errCaptureFull
+}
+
 func (s *state) runBuiltin(ctx context.Context, args []string) error {
 	hc := interp.HandlerCtx(ctx)
-	streams := stdio.Stdio{Stdin: hc.Stdin, Stdout: hc.Stdout, Stderr: hc.Stderr}
 
+	ctx, done := context.WithCancel(ctx)
+	defer done()
+
+	streams := stdio.Stdio{Stdin: hc.Stdin, Stdout: hc.Stdout, Stderr: hc.Stderr}
+	out, capture := capturing(streams.Stdout, done)
+	streams.Stdout = out
+
+	err := s.answerBuiltin(ctx, streams, args)
+	if capture.filled() {
+		fmt.Fprintln(hc.Stderr, errorStyle.Render(captureFull))
+		return interp.ExitStatus(1)
+	}
+	return err
+}
+
+func (s *state) answerBuiltin(ctx context.Context, streams stdio.Stdio, args []string) error {
 	args = append([]string{strings.TrimPrefix(args[0], BuiltinMarker)}, args[1:]...)
 	if slices.Contains(sessionBuiltinNames, args[0]) {
 		return s.runSessionBuiltin(streams, args)
@@ -100,13 +169,13 @@ func (s *state) runBuiltin(ctx context.Context, args []string) error {
 		return nil
 	}
 	if !ok {
-		fmt.Fprintln(hc.Stderr, errorStyle.Render(unknownBuiltin(args[0])))
+		fmt.Fprintln(streams.Stderr, errorStyle.Render(unknownBuiltin(args[0])))
 		return interp.ExitStatus(statusBuiltinNotFound)
 	}
 
 	code, err := builtin.Run(ctx, streams, args)
 	if err != nil {
-		fmt.Fprintln(hc.Stderr, errorStyle.Render(err.Error()))
+		fmt.Fprintln(streams.Stderr, errorStyle.Render(err.Error()))
 		if code == 0 {
 			code = 1
 		}
