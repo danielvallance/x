@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -1066,4 +1067,193 @@ func TestAFailingProbeSaysWhy(t *testing.T) {
 	_, err := s.Stat(t.Context(), "/", "/etc", true)
 	require.ErrorContains(t, err, "out of memory")
 	assert.NotErrorIs(t, err, fs.ErrNotExist, "a probe that complained did not find the path missing")
+}
+
+// envTransport answers the environment probe and keeps what the last command
+// was given to run with.
+type envTransport struct {
+	environ string
+
+	mu  sync.Mutex
+	env []string
+}
+
+func (t *envTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	if len(cmd.Args) > 2 && cmd.Args[2] == environProbe {
+		fmt.Fprint(cmd.Streams.Stdout, t.environ)
+		return 0, nil
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.env = slices.Clone(cmd.Env)
+	return 0, nil
+}
+
+func (t *envTransport) lastEnv() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.env)
+}
+
+func TestEvalIsVettedLikeALine(t *testing.T) {
+	transport := newHaltingTransport()
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "eval 'allowed'")
+	require.NoError(t, err)
+	assert.Contains(t, transport.commands(), "allowed", "a line the vet allows still runs")
+
+	_, err = s.RunLine(t.Context(), "eval 'smuggled &'")
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "eval: ")
+	assert.Contains(t, out.String(), "& is not supported")
+	assert.NotContains(t, transport.commands(), "smuggled",
+		"what the vet refuses on a line it refuses through eval too")
+
+	for _, line := range []string{"command eval 'smuggled &'", "command -- eval 'smuggled &'", "builtin eval 'smuggled &'"} {
+		_, err = s.RunLine(t.Context(), line)
+		require.NoError(t, err)
+		assert.NotContains(t, transport.commands(), "smuggled",
+			"%s reaches the interpreter's own eval, so the vet looks past the words in front", line)
+	}
+
+	asking, _, said := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+	_, err = asking.RunLine(t.Context(), "command -v eval")
+	require.NoError(t, err)
+	assert.NotContains(t, said.String(), "eval: ", "asking where eval is runs nothing to vet")
+}
+
+func TestEvalCannotSmuggleProcessSubstitution(t *testing.T) {
+	transport := newHaltingTransport()
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "eval 'true <(:)'")
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "process substitution is not supported",
+		"the pipe would be made on this machine, in a directory the instance named")
+}
+
+func TestEvalSurvivesWhatItCannotParse(t *testing.T) {
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+
+	_, err := s.RunLine(t.Context(), "eval 'for'")
+
+	require.NoError(t, err)
+	assert.Contains(t, out.String(), "eval: ")
+	assert.False(t, s.Exited(), "a refusal is not the end of the session")
+}
+
+func TestSourceIsRefused(t *testing.T) {
+	for _, line := range []string{"source /etc/profile", ". /etc/profile", "builtin source /etc/profile"} {
+		t.Run(line, func(t *testing.T) {
+			transport := newHaltingTransport()
+			s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+			_, err := s.RunLine(t.Context(), line)
+
+			require.NoError(t, err)
+			assert.Contains(t, out.String(), "is not supported, the file would be read here")
+			for _, ran := range transport.commands() {
+				assert.NotContains(t, ran, readScript, "the file was never even fetched")
+			}
+		})
+	}
+}
+
+func TestATrapActionIsVetted(t *testing.T) {
+	t.Run("refuses-what-the-vet-refuses", func(t *testing.T) {
+		transport := newHaltingTransport()
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap 'smuggled &' EXIT")
+		require.NoError(t, err)
+		require.NoError(t, s.Close(t.Context()))
+
+		assert.Contains(t, out.String(), "trap: ")
+		assert.NotContains(t, transport.commands(), "smuggled",
+			"the action never became the session's to run on the way out")
+	})
+
+	t.Run("keeps-an-action-it-allows", func(t *testing.T) {
+		transport := newHaltingTransport()
+		s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap 'on-the-way-out' EXIT")
+		require.NoError(t, err)
+		require.NoError(t, s.Close(t.Context()))
+
+		assert.Contains(t, transport.commands(), "on-the-way-out", "the trap still fires on the way out")
+	})
+
+	t.Run("refuses-an-action-behind-the-end-of-options", func(t *testing.T) {
+		transport := newHaltingTransport()
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap -- 'smuggled &' EXIT")
+		require.NoError(t, err)
+		require.NoError(t, s.Close(t.Context()))
+
+		assert.Contains(t, out.String(), "trap: ")
+		assert.NotContains(t, transport.commands(), "smuggled",
+			"the interpreter reads past --, and so does the vet")
+	})
+
+	t.Run("leaves-a-trap-that-only-names-a-signal", func(t *testing.T) {
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+
+		for _, line := range []string{"trap", "trap EXIT", "trap -- EXIT"} {
+			_, err := s.RunLine(t.Context(), line)
+			require.NoError(t, err)
+		}
+
+		assert.NotContains(t, out.String(), "trap: ", "no action is installed, so there is none to vet")
+	})
+
+	t.Run("leaves-a-trap-that-clears-one", func(t *testing.T) {
+		s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(newHaltingTransport().Exec)})
+
+		_, err := s.RunLine(t.Context(), "trap - EXIT")
+
+		require.NoError(t, err)
+		assert.NotContains(t, out.String(), "trap: ", "clearing a trap parses to a command like any other")
+	})
+}
+
+func TestTheInterpreterKeepsItsOwnTempDir(t *testing.T) {
+	kept, tmpdir, exported := withoutTmpdir([]string{"HOME=/", "TMPDIR=/instance/tmp", "PATH=/bin"})
+
+	assert.Equal(t, []string{"HOME=/", "PATH=/bin"}, kept,
+		"what the interpreter runs on names no directory of the instance's choosing")
+	assert.Equal(t, "/instance/tmp", tmpdir)
+	assert.True(t, exported)
+
+	_, tmpdir, exported = withoutTmpdir([]string{"TMPDIR="})
+	assert.Empty(t, tmpdir)
+	assert.True(t, exported, "an empty one is still one the instance exported")
+
+	_, _, exported = withoutTmpdir([]string{"HOME=/"})
+	assert.False(t, exported)
+}
+
+func TestACommandStillHasTheInstancesTempDir(t *testing.T) {
+	transport := &envTransport{environ: "HOME=/\x00PATH=/bin\x00TMPDIR=/instance/tmp\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "somewhere")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.lastEnv(), "TMPDIR=/instance/tmp",
+		"the instance's own commands keep the directory the instance exported")
+}
+
+func TestACommandKeepsAnEmptyTempDir(t *testing.T) {
+	transport := &envTransport{environ: "HOME=/\x00PATH=/bin\x00TMPDIR=\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "somewhere")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.lastEnv(), "TMPDIR=",
+		"the instance exported it empty, so a command still sees it empty and not unset")
 }
