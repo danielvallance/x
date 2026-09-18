@@ -1257,3 +1257,178 @@ func TestACommandKeepsAnEmptyTempDir(t *testing.T) {
 	assert.Contains(t, transport.lastEnv(), "TMPDIR=",
 		"the instance exported it empty, so a command still sees it empty and not unset")
 }
+
+// floodTransport answers one command with output that never ends, and keeps
+// the context it was handed so a test can see it cut short.
+type floodTransport struct {
+	mu      sync.Mutex
+	stopped bool
+}
+
+func (t *floodTransport) Exec(ctx context.Context, cmd Command) (int, error) {
+	if cmd.Args[0] != "flood" {
+		return 0, nil
+	}
+	chunk := bytes.Repeat([]byte("x"), 64<<10)
+	for {
+		_, err := cmd.Streams.Stdout.Write(chunk)
+		if err == nil && ctx.Err() == nil {
+			continue
+		}
+		t.mu.Lock()
+		t.stopped = ctx.Err() != nil
+		t.mu.Unlock()
+		return StatusInterrupted, nil
+	}
+}
+
+func (t *floodTransport) cutShort() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopped
+}
+
+func TestACaptureIsCapped(t *testing.T) {
+	transport := &floodTransport{}
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	status, err := s.RunLine(t.Context(), "captured=$(flood)")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, status, "the command substitution failed rather than filling this machine")
+	assert.Contains(t, out.String(), "command substitution kept more than 8 MiB")
+	assert.True(t, transport.cutShort(), "the instance was told to stop, not left to write on")
+}
+
+func TestASmallCaptureIsUntouched(t *testing.T) {
+	transport := scriptTransport("hi\n")
+	s, _, out := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	status, err := s.RunLine(t.Context(), "captured=$(say-hi); printf %s \"$captured\"")
+
+	require.NoError(t, err)
+	assert.Zero(t, status)
+	assert.Contains(t, out.String(), "hi", "what fits is kept byte for byte")
+}
+
+func TestAStreamIsNotCapped(t *testing.T) {
+	var written int64
+	transport := ExecTransport(func(ctx context.Context, cmd Command) (int, error) {
+		if cmd.Args[0] != "flood" {
+			return 0, nil
+		}
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for range 200 {
+			n, err := cmd.Streams.Stdout.Write(chunk)
+			written += int64(n)
+			if err != nil {
+				return 1, nil
+			}
+		}
+		return 0, nil
+	})
+	s, _, _ := newDrivenSession(t, Config{Transport: transport})
+
+	status, err := s.RunLine(t.Context(), "flood > /dev/null")
+
+	require.NoError(t, err)
+	assert.Zero(t, status)
+	assert.Equal(t, int64(200*(64<<10)), written,
+		"a stream answers for its own size, so the cap left it alone")
+}
+
+func TestAProbeIsCapped(t *testing.T) {
+	flood := ExecTransport(func(_ context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("d name\x00"), 1<<10)
+		for range 1 << 10 {
+			if _, err := cmd.Streams.Stdout.Write(chunk); err != nil {
+				return 1, nil
+			}
+		}
+		return 0, nil
+	})
+
+	_, err := flood.ReadDir(t.Context(), "/", "big")
+
+	require.ErrorContains(t, err, "more than 4 MiB",
+		"a directory listing is not the instance's to make this machine hold")
+}
+
+func TestABuiltinsCaptureIsCapped(t *testing.T) {
+	flooding := map[string]Builtin{
+		"flood": BuiltinFunc(func(ctx context.Context, streams stdio.Stdio, _ []string) (int, error) {
+			chunk := bytes.Repeat([]byte("x"), 64<<10)
+			for ctx.Err() == nil {
+				if _, err := streams.Stdout.Write(chunk); err != nil {
+					return 1, nil
+				}
+			}
+			return 0, nil
+		}),
+	}
+	s, _, out := newDrivenSession(t, Config{
+		Transport: ExecTransport(scriptTransport("").Exec),
+		Builtins:  flooding,
+	})
+
+	status, err := s.RunLine(t.Context(), "captured=$(:flood)")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, status, "a builtin fills a command substitution as readily as the instance")
+	assert.Contains(t, out.String(), "command substitution kept more than 8 MiB")
+}
+
+func TestAProbesComplaintIsCapped(t *testing.T) {
+	flood := ExecTransport(func(_ context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for range 1 << 7 {
+			if _, err := cmd.Streams.Stderr.Write(chunk); err != nil {
+				return 1, nil
+			}
+		}
+		return 1, nil
+	})
+
+	_, err := flood.Stat(t.Context(), "/", "somewhere", true)
+
+	require.ErrorContains(t, err, "more than 4 MiB",
+		"what the helper complains with is held here too")
+}
+
+func TestAFloodingProbeIsCutShort(t *testing.T) {
+	var wrote int64
+	flood := ExecTransport(func(ctx context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("d name\x00"), 1<<10)
+		for ctx.Err() == nil {
+			n, err := cmd.Streams.Stdout.Write(chunk)
+			wrote += int64(n)
+			if err != nil {
+				return 1, nil
+			}
+		}
+		return 1, nil
+	})
+
+	_, err := flood.ReadDir(t.Context(), "/", "big")
+
+	require.ErrorContains(t, err, "more than 4 MiB")
+	assert.Less(t, wrote, int64(2*maxProbeOutput),
+		"the instance was told to stop rather than left to send the rest")
+}
+
+func TestTheEnvironmentProbeIsCapped(t *testing.T) {
+	flood := ExecTransport(func(ctx context.Context, cmd Command) (int, error) {
+		chunk := bytes.Repeat([]byte("NAME=value\x00"), 1<<10)
+		for ctx.Err() == nil {
+			if _, err := cmd.Streams.Stdout.Write(chunk); err != nil {
+				return 1, nil
+			}
+		}
+		return 1, nil
+	})
+
+	_, err := flood.Environ(t.Context())
+
+	require.ErrorContains(t, err, "more than 4 MiB",
+		"an instance does not get to fill this machine while the session is opening")
+}
