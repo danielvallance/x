@@ -7,6 +7,7 @@ package shell
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -1497,4 +1498,172 @@ func TestAProbeErrorKeepsTheNodeToItself(t *testing.T) {
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), "node-7.fra0.example",
 		"a file question fails the same way a command does")
+}
+
+// askedTransport answers the instance's file questions and keeps what it was
+// asked, so a test can count the round trips a line costs.
+type askedTransport struct {
+	environ string
+	kind    string
+
+	mu    sync.Mutex
+	asked []string
+}
+
+func (t *askedTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	snippet := ""
+	if len(cmd.Args) > 2 {
+		snippet = cmd.Args[2]
+	}
+
+	switch snippet {
+	case environProbe:
+		fmt.Fprint(cmd.Streams.Stdout, cmp.Or(t.environ, "EUID=0\x00"))
+		return 0, nil
+	case statScript:
+		t.record("stat " + cmd.Args[4])
+		fmt.Fprintln(cmd.Streams.Stdout, cmp.Or(t.kind, "d")+" 0 0 -")
+	case accessScript:
+		t.record("access " + cmd.Args[4])
+		fmt.Fprintln(cmd.Streams.Stdout, "ok")
+	default:
+		t.record("run " + cmd.Args[0])
+	}
+	return 0, nil
+}
+
+func (t *askedTransport) record(what string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.asked = append(t.asked, what)
+}
+
+func (t *askedTransport) questions() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return slices.Clone(t.asked)
+}
+
+func TestCdAsksTheInstanceOnce(t *testing.T) {
+	transport := &askedTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+
+	require.NoError(t, err)
+	assert.Equal(t, "/var/log", s.Dir())
+	assert.Equal(t, []string{"stat /var/log"}, transport.questions(),
+		"a stat already says root may enter the directory it describes")
+}
+
+func TestTheSamePathIsAskedAfterOnce(t *testing.T) {
+	transport := &askedTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+	require.NoError(t, err)
+	_, err = s.RunLine(t.Context(), "cd /var/log")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"stat /var/log"}, transport.questions(),
+		"nothing ran on the instance in between, so the answer still holds")
+}
+
+func TestWhatRanOnTheInstanceIsNotRemembered(t *testing.T) {
+	transport := &askedTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log; something; cd /var/log")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"stat /var/log", "run something", "stat /var/log"},
+		transport.questions(), "a command may have moved what was there")
+}
+
+func TestANonRootSessionStillAsksAboutAccess(t *testing.T) {
+	transport := &askedTransport{environ: "EUID=1000\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"stat /var/log", "access /var/log"}, transport.questions(),
+		"only root enters a directory whatever its mode says")
+}
+
+func TestOnlyADirectoryIsAnsweredFromAStat(t *testing.T) {
+	transport := &askedTransport{kind: "f"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "[ -x /bin/tool ]")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.questions(), "access /bin/tool",
+		"whether a file runs is the instance's to say, the stat not carrying its mode")
+}
+
+func TestTheSessionCannotTalkItselfIntoBeingRoot(t *testing.T) {
+	transport := &askedTransport{environ: "EUID=1000\x00"}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "export EUID=0; cd /var/log")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.questions(), "access /var/log",
+		"who the session is was settled by the instance, not by what it later assigned")
+}
+
+func TestTheCommandLineCannotEitherClaimRoot(t *testing.T) {
+	transport := &askedTransport{environ: "EUID=1000\x00"}
+	s, _, _ := newDrivenSession(t, Config{
+		Transport: ExecTransport(transport.Exec),
+		Env:       map[string]string{"EUID": "0"},
+	})
+
+	_, err := s.RunLine(t.Context(), "cd /var/log")
+
+	require.NoError(t, err)
+	assert.Contains(t, transport.questions(), "access /var/log",
+		"an environment the caller passed in is not the instance speaking")
+}
+
+func TestAStatThatFailedIsAskedAgain(t *testing.T) {
+	transport := &refusingStatTransport{}
+	s, _, _ := newDrivenSession(t, Config{Transport: ExecTransport(transport.Exec)})
+
+	_, err := s.RunLine(t.Context(), "[ -d /gone ]; [ -d /gone ]")
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, transport.stats,
+		"a question the instance could not answer is not an answer to keep")
+}
+
+// refusingStatTransport opens a session and then fails every stat it is asked.
+type refusingStatTransport struct{ stats int }
+
+func (t *refusingStatTransport) Exec(_ context.Context, cmd Command) (int, error) {
+	if len(cmd.Args) > 2 && cmd.Args[2] == statScript {
+		t.stats++
+		return 0, errors.New("the instance is not answering")
+	}
+	return 0, nil
+}
+
+func TestAStatOvertakenByACommandIsNotKept(t *testing.T) {
+	s := &state{}
+	key := statKey{path: "/var/log", follow: true}
+
+	// What a pipeline does: one branch asks about a path while the other runs
+	// something on the instance and finishes first.
+	asOf := s.statsAsOf()
+	s.forgetStats()
+	s.rememberStat(key, remoteFileInfo{name: "log", kind: "d"}, asOf)
+
+	_, asked := s.recalledStat(key)
+	assert.False(t, asked, "the answer described the instance as it was before that command")
+
+	asOf = s.statsAsOf()
+	s.rememberStat(key, remoteFileInfo{name: "log", kind: "d"}, asOf)
+	_, asked = s.recalledStat(key)
+	assert.True(t, asked, "nothing ran while this one was being asked")
 }

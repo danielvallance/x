@@ -59,6 +59,7 @@ var sessionBuiltinNames = []string{"history"}
 // command to the instance.
 func (s *state) route(_ interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
+		s.forgetStats()
 		if len(args[0]) > len(BuiltinMarker) && strings.HasPrefix(args[0], BuiltinMarker) {
 			return s.runBuiltin(ctx, args)
 		}

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"os/signal"
@@ -85,6 +86,11 @@ type state struct {
 	history     *sessionHistory
 	interrupts  chan os.Signal
 	exiting     atomic.Bool
+	euid        string
+
+	statsMu  sync.Mutex
+	stats    map[statKey]fs.FileInfo
+	statsGen uint64
 }
 
 func (s *state) dir() string {
@@ -509,7 +515,6 @@ func reparsing(args []string) []string {
 		switch args[0] {
 		case "builtin", "command":
 			args = args[1:]
-			// The interpreter stops reading options here and runs what follows.
 			if args[0] == "--" && len(args) > 1 {
 				args = args[1:]
 			}
@@ -601,6 +606,7 @@ func (s *state) environ(ctx context.Context) ([]string, error) {
 			vars[name] = value
 		}
 	}
+	s.euid = vars["EUID"]
 	maps.Copy(vars, s.cfg.Env)
 
 	for name, fallback := range environFallbacks {

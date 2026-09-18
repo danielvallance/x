@@ -343,8 +343,6 @@ func (a *ackWriter) announce(err error) {
 // redirect runs a helper that streams a file, and reports any errors that may
 // occur
 func (e ExecTransport) redirect(ctx context.Context, op, p, snippet string, streams stdio.Stdio) error {
-	// Its stdout is the file being streamed, so only what it complains with is
-	// this machine's to hold.
 	errOut := cappedBuffer{limit: maxProbeOutput}
 	streams.Stderr = &errOut
 
@@ -426,7 +424,6 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	}
 	if !c.full {
 		c.full = true
-		// Nothing more is worth keeping, so nothing more is worth sending.
 		if c.stop != nil {
 			c.stop()
 		}
