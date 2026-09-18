@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -1431,4 +1433,68 @@ func TestTheEnvironmentProbeIsCapped(t *testing.T) {
 
 	require.ErrorContains(t, err, "more than 4 MiB",
 		"an instance does not get to fill this machine while the session is opening")
+}
+
+// nodeError is what a transport reaching a node over HTTP fails with.
+func nodeError() error {
+	return fmt.Errorf("failed to start command: %w", &url.Error{
+		Op:  "Post",
+		URL: "https://node-7.fra0.example/v1/instances/abc/plugins/sandbox/commands?token=s3cret",
+		Err: &net.OpError{
+			Op:   "dial",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 5), Port: 443},
+			Err:  errors.New("connect: connection refused"),
+		},
+	})
+}
+
+// failingTransport opens a session and then fails every command it is asked to run.
+func failingTransport(err error) ExecTransport {
+	return func(_ context.Context, cmd Command) (int, error) {
+		if len(cmd.Args) > 2 && cmd.Args[2] == environProbe {
+			return 0, nil
+		}
+		return 0, err
+	}
+}
+
+func TestATransportErrorKeepsTheNodeToItself(t *testing.T) {
+	s, _, out := newDrivenSession(t, Config{Transport: failingTransport(nodeError())})
+
+	status, err := s.RunLine(t.Context(), "somewhere")
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, status)
+	said := out.String()
+	assert.NotContains(t, said, "node-7.fra0.example", "the node the transport reached is not the user's business")
+	assert.NotContains(t, said, "s3cret")
+	assert.NotContains(t, said, "10.0.0.5")
+	assert.Contains(t, said, "failed to start command", "what the transport wrote for a person survives")
+	assert.Contains(t, said, "connection refused", "and so does why it failed")
+}
+
+func TestAnErrorKeepsWhatTheTransportSaid(t *testing.T) {
+	plain := errors.New("the instance has no sh")
+
+	assert.Same(t, plain, sanitised(plain), "an error naming no address is the one it was given")
+	assert.NoError(t, sanitised(nil))
+}
+
+func TestASanitisedErrorIsStillTheOneItWasMadeFrom(t *testing.T) {
+	err := sanitised(fmt.Errorf("reading: %w", &url.Error{
+		Op: "Get", URL: "https://node-7.example/logs", Err: fs.ErrNotExist,
+	}))
+
+	require.ErrorIs(t, err, fs.ErrNotExist, "what the shell tests errors for still answers")
+	assert.NotContains(t, err.Error(), "node-7.example")
+	assert.Contains(t, err.Error(), "reading: Get: ")
+}
+
+func TestAProbeErrorKeepsTheNodeToItself(t *testing.T) {
+	_, err := failingTransport(nodeError()).Stat(t.Context(), "/", "somewhere", true)
+
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "node-7.fra0.example",
+		"a file question fails the same way a command does")
 }

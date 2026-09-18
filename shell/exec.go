@@ -95,7 +95,7 @@ func (s *state) runRemote(ctx context.Context, args []string) error {
 	case err != nil && ctx.Err() != nil:
 		return interp.ExitStatus(StatusInterrupted)
 	case err != nil:
-		fmt.Fprintln(hc.Stderr, errorStyle.Render(err.Error()))
+		fmt.Fprintln(hc.Stderr, errorStyle.Render(sanitised(err).Error()))
 		return interp.ExitStatus(1)
 	}
 	return codeToExitStatus(code)

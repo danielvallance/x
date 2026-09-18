@@ -10,7 +10,10 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"net"
+	"net/url"
 	"os/exec"
+	"strings"
 	"syscall"
 
 	"unikraft.com/x/stdio"
@@ -91,3 +94,40 @@ type exitCoder interface {
 	error
 	ExitCode() int
 }
+
+// sanitised is a transport's error to show a person, with the URL and the
+// network address of whatever it reached taken out of the text.
+func sanitised(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	said := err.Error()
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		switch e := cause.(type) {
+		case *url.Error:
+			if e.Err != nil {
+				said = strings.Replace(said, e.Error(), e.Op+": "+e.Err.Error(), 1)
+			}
+		case *net.OpError:
+			if e.Err != nil {
+				said = strings.Replace(said, e.Error(), strings.TrimSpace(e.Op+" "+e.Net)+": "+e.Err.Error(), 1)
+			}
+		}
+	}
+
+	if said == err.Error() {
+		return err
+	}
+	return sanitisedError{error: err, said: said}
+}
+
+// sanitisedError is the error it was made from, and only its text differs.
+type sanitisedError struct {
+	error
+	said string
+}
+
+func (e sanitisedError) Error() string { return e.said }
+
+func (e sanitisedError) Unwrap() error { return e.error }

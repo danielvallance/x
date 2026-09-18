@@ -191,10 +191,10 @@ func (e ExecTransport) Environ(ctx context.Context) ([]string, error) {
 		case err == nil:
 			return environOf(out.String()), nil
 		case ctx.Err() != nil:
-			return nil, err
+			return nil, sanitised(err)
 		}
 	}
-	return nil, err
+	return nil, sanitised(err)
 }
 
 // environOf is the NUL-separated record the environ probe prints.
@@ -355,7 +355,7 @@ func (e ExecTransport) redirect(ctx context.Context, op, p, snippet string, stre
 	})
 	switch {
 	case err != nil:
-		return &fs.PathError{Op: op, Path: p, Err: err}
+		return &fs.PathError{Op: op, Path: p, Err: sanitised(err)}
 	case ctx.Err() != nil:
 		return nil
 	case code < 0:
@@ -398,7 +398,7 @@ func (e ExecTransport) script(ctx context.Context, snippet string, args ...strin
 	case out.full || errOut.full:
 		return "", fmt.Errorf("the instance answered with more than %d MiB", maxProbeOutput>>20)
 	case err != nil:
-		return "", err
+		return "", sanitised(err)
 	case code < 0:
 		return "", fmt.Errorf("the probe was signalled (%d)", -code)
 	case code != 0:
